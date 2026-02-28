@@ -17,8 +17,10 @@ Usage
 
 from __future__ import annotations
 
+import collections
 import os
 import sys
+import time
 import wave as wave_mod
 
 import numpy as np
@@ -38,35 +40,26 @@ SAMPLE_RATE = 16_000       # Record at model rate for simplicity
 CHANNELS = 1
 
 # Speaker-ID gating
-CHUNK_DURATION = 0.60      # trailing window
+CHUNK_DURATION = 0.30      # trailing window
 CHUNK_HOP = 0.05           # AI analysis hop (seconds)
-THRESHOLD = 0.25           # Similarity threshold
+THRESHOLD = 0.28           # Higher threshold prevents false positives (e.g. your friend)
+HANG_THRESHOLD = 0.25      # Lower threshold to KEEP gate open if it was already open
+HANG_TIME = 0.4            # Seconds to keep gate open after Target X stops speaking
 
 # Spectral processing
 FFT_SIZE = 1024
 HOP_SIZE = 512
 
 TARGET_GAIN = 2.5          # Amplification for Target X
-OVERSUBTRACT_TARGET = 3.0  # Aggressive noise removal for Target X
+OVERSUBTRACT_TARGET = 4.0  # Reduced from 6.0 to prevent muffling Target X's voice
 OVERSUBTRACT_BG = 0.0      # NO noise removal when nobody speaks (normal background)
 BG_GAIN = 1.0              # Normal listening volume for background
-SPECTRAL_FLOOR = 0.05      # Minimum fraction of original magnitude kept
+SPECTRAL_FLOOR = 0.01      # Minimum fraction of original magnitude kept
 
 NOISE_EMA = 0.95           # Exponential moving average for noise estimate
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..")
 TARGET_NPY = os.path.join(os.path.dirname(__file__), "..", "noise_gate", "target.npy")
-
-def record_audio(duration: float, label: str) -> np.ndarray:
-    """Record mono float32 audio."""
-    input(f"\n  Press Enter to record {label} … ")
-    print(f"  🎙  Recording {duration}s …")
-    audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE,
-                   channels=CHANNELS, dtype="float32")
-    sd.wait()
-    print("  ✓  Done.\n")
-    return audio[:, 0]
-
 
 def save_wav(path: str, audio: np.ndarray, sr: int) -> None:
     """Save float32 numpy → 16-bit WAV."""
@@ -173,55 +166,89 @@ def main():
     target_emb = torch.from_numpy(np.load(TARGET_NPY)).float().to(device)
     print("  ✓  Loaded target.npy embedding.")
 
-    print(f"\n── STEP 1: Record {RECORD_DURATION}s noisy audio ──")
+    print(f"\n── STEP 1 & 2: Record {RECORD_DURATION}s and Live Classify ──")
     print("  TIP: alternate between NOISE and TARGET X.")
-    noisy = record_audio(RECORD_DURATION, f"{RECORD_DURATION}s test audio")
+    input(f"\n  Press Enter to start … ")
 
-    print("\n── STEP 2: Speaker ID Classification ──")
     chunk_samples = int(CHUNK_DURATION * SAMPLE_RATE)
     hop_samples = int(CHUNK_HOP * SAMPLE_RATE)
-    total = len(noisy)
-    state_map = np.zeros(total, dtype=np.int32)
+    total_hops = int(RECORD_DURATION * SAMPLE_RATE / hop_samples)
     
-    pos = 0
-    idx = 0
-    padded_noisy = np.concatenate([np.zeros(chunk_samples, dtype=np.float32), noisy])
+    audio_full = []
+    state_map_list = []
     
-    while pos < total:
-        chunk = padded_noisy[pos : pos + chunk_samples]
-        rms = np.sqrt(np.mean(chunk ** 2))
-
-        if rms < 5e-4:
-            state = 0
-            tag = "   BACKGROUND "
-        else:
-            chunk_clean = nr.reduce_noise(y=chunk, sr=SAMPLE_RATE, stationary=True, prop_decrease=0.9)
-            ct = torch.from_numpy(chunk_clean).unsqueeze(0).float().to(device)
-            with torch.no_grad():
-                ce = model.encode_batch(ct).squeeze()
-                
-            sim_t = torch.nn.functional.cosine_similarity(ce.unsqueeze(0), target_emb.unsqueeze(0)).item()
+    q = collections.deque()
+    def audio_callback(indata, frames, t_info, status):
+        q.append(indata[:, 0].copy())
+        
+    rolling_buffer = np.zeros(chunk_samples, dtype=np.float32)
+    last_target_time = -999.0
+    
+    print("  🎙  Recording ...")
+    
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', blocksize=hop_samples, callback=audio_callback):
+        state = 0
+        for hop_idx in range(total_hops):
+            while len(q) == 0:
+                time.sleep(0.005)
+            hop_data = q.popleft()
+            audio_full.append(hop_data)
             
-            if sim_t > THRESHOLD:
-                state = 1
-                tag = "🟢 TARGET X   "
-            else:
+            rolling_buffer = np.roll(rolling_buffer, -hop_samples)
+            rolling_buffer[-hop_samples:] = hop_data
+            
+            chunk = rolling_buffer
+            rms = np.sqrt(np.mean(chunk ** 2))
+
+            t_sec = (hop_idx * hop_samples) / SAMPLE_RATE
+
+            if rms < 5e-4:
                 state = 0
                 tag = "   BACKGROUND "
+                infer_time_ms = 0.0
+                sim_t = 0.0
+            else:
+                chunk_clean = nr.reduce_noise(y=chunk, sr=SAMPLE_RATE, stationary=True, prop_decrease=0.9)
+                ct = torch.from_numpy(chunk_clean).unsqueeze(0).float().to(device)
+                
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    ce = model.encode_batch(ct).squeeze()
+                    
+                sim_t = torch.nn.functional.cosine_similarity(ce.unsqueeze(0), target_emb.unsqueeze(0)).item()
+                infer_time_ms = (time.perf_counter() - t0) * 1000.0
+                
+                # Logic with Hysteresis & Dual Thresholds
+                if sim_t > THRESHOLD:
+                    # Strong match
+                    state = 1
+                    tag = "🟢 TARGET X   "
+                    last_target_time = t_sec
+                elif state == 1 and sim_t > HANG_THRESHOLD:
+                    # Medium match while already open
+                    state = 1
+                    tag = "🟢 TARGET X   "
+                    last_target_time = t_sec
+                else:
+                    # Weak match: hang time decay
+                    if t_sec - last_target_time < HANG_TIME:
+                        state = 1
+                        tag = "🟢 TARGET X   "
+                    else:
+                        state = 0
+                        tag = "   BACKGROUND "
 
-        end_hop = min(pos + hop_samples, total)
-        state_map[pos:end_hop] = state
+            state_map_list.append(np.full(hop_samples, state, dtype=np.int32))
 
-        t_sec = pos / SAMPLE_RATE
-        if rms < 5e-4:
-            print(f"  t={t_sec:5.1f}s  {tag} (rms={rms:.5f} < 5e-4)")
-        else:
-            print(f"  t={t_sec:5.1f}s  {tag} (rms={rms:.4f} sim_T={sim_t:+.2f})")
+            if rms < 5e-4:
+                print(f"\r  t={t_sec:5.1f}s  {tag} (rms={rms:.5f} < 5e-4)                  ", end="", flush=True)
+            else:
+                print(f"\r  t={t_sec:5.1f}s  {tag} (rms={rms:.4f} sim_T={sim_t:+.2f} infer={infer_time_ms:4.1f}ms)", end="", flush=True)
+                
+    noisy = np.concatenate(audio_full)
+    state_map = np.concatenate(state_map_list)
 
-        pos += hop_samples
-        idx += 1
-
-    print("\n── STEP 3: Spectral Processing ──")
+    print("\n\n── STEP 3: Spectral Processing ──")
     filtered = spectral_process(noisy, state_map)
 
     orig_path = os.path.abspath(os.path.join(OUTPUT_DIR, "output_original.wav"))

@@ -41,18 +41,20 @@ BLOCK_SIZE = 512           # Audio callback frame size (≈ 10 ms at 48 kHz)
 FFT_SIZE = 1024            # STFT window length (≈ 21 ms at 48 kHz)
 HOP_SIZE = BLOCK_SIZE      # STFT hop = callback frame size (50 % overlap)
 
-BUFFER_DURATION = 0.6      # Ring-buffer length for AI thread (600ms trailing)
+BUFFER_DURATION = 0.3      # Ring-buffer length for AI thread (90ms trailing)
 CHANNELS = 1               # Mono
 MODEL_SR = 16_000          # SpeechBrain expected sample rate
 
 # Thresholds
-THRESHOLD = 0.25           # Similarity threshold to trigger state change
+THRESHOLD = 0.28           # Higher threshold prevents false positives (e.g. your friend)
+HANG_THRESHOLD = 0.25      # Lower threshold to KEEP gate open if it was already open
 RMS_THRESHOLD = 5e-4       # Minimum loudness to bother running AI model
+HANG_TIME = 0.5            # Seconds to keep gate open after Target X stops speaking
 
 # Spectral processing
 TARGET_GAIN = 2.5          # Amplification for Target X
-OVERSUBTRACT_TARGET = 3.0  # Aggressive noise removal when Target X is speaking
-SPECTRAL_FLOOR = 0.05      # Minimum fraction of original magnitude kept
+OVERSUBTRACT_TARGET = 4.0  # Reduced from 6.0 to prevent muffling Target X's voice
+SPECTRAL_FLOOR = 0.01      # Minimum fraction of original magnitude kept
 
 OVERSUBTRACT_BG = 0.0      # NO noise suppression when nobody is speaking (normal background)
 BG_GAIN = 1.0              # Normal listening volume for background
@@ -195,11 +197,15 @@ def inference_thread(model: EncoderClassifier, target_emb: torch.Tensor, device:
     global target_is_speaking, current_sim_t
 
     resampler = torchaudio.transforms.Resample(native_sr, MODEL_SR).to(device)
-    print("\n🎧  AI inference thread running …\n")
+    print("\n🎧  AI inference thread ready …\n")
+    
+    was_speaking = False
+    last_target_time = 0.0
 
     while True:
         with ring_lock:
-            snapshot = ring_buffer.copy()
+            # Unroll the ring buffer so it is chronologically ordered
+            snapshot = np.concatenate((ring_buffer[ring_write_pos:], ring_buffer[:ring_write_pos]))
 
         rms = np.sqrt(np.mean(snapshot ** 2))
         
@@ -207,34 +213,52 @@ def inference_thread(model: EncoderClassifier, target_emb: torch.Tensor, device:
         if rms < RMS_THRESHOLD:
             target_is_speaking = False
             current_sim_t = 0.0
-            print(f"\r   BACKGROUND (quiet)   rms={rms:.5f}                 ", end="", flush=True)
-            time.sleep(0.05)
+            infer_time_ms = 0.0  # <--- FIX: Ensure variable exists when skipping AI
+            print(f"\r   BACKGROUND             rms={rms:.4f}                ", end="", flush=True)
+            time.sleep(0.01)
             continue
 
         waveform = torch.from_numpy(snapshot).unsqueeze(0).float().to(device)
         waveform_16k = resampler(waveform)
 
-        # Denoise buffer chunk to improve ECAPA-TDNN robustness in noise
-        audio_16k = waveform_16k.squeeze().cpu().numpy()
-        audio_clean = nr.reduce_noise(y=audio_16k, sr=MODEL_SR, stationary=True, prop_decrease=0.9)
-        waveform_clean = torch.from_numpy(audio_clean).unsqueeze(0).float().to(device)
-
+        t0 = time.perf_counter()
         with torch.no_grad():
-            emb = model.encode_batch(waveform_clean).squeeze()
+            emb = model.encode_batch(waveform_16k).squeeze()
 
         sim_t = torch.nn.functional.cosine_similarity(emb.unsqueeze(0), target_emb.unsqueeze(0)).item()
         current_sim_t = sim_t
+        infer_time_ms = (time.perf_counter() - t0) * 1000.0  # Decision Logic
         
-        # Decision Logic
+        # State Logic with Hysteresis (Hang Time & Dual Thresholds)
         if sim_t > THRESHOLD:
+            # Strong match: Open the gate and reset hang timer
             target_is_speaking = True
-            tag = "🟢 TARGET X   "
+            tag = "🟢 TARGET X  "
+            last_target_time = time.time()
+        elif target_is_speaking and sim_t > HANG_THRESHOLD:
+            # Medium match while already open: Keep gate open and reset hang timer
+            target_is_speaking = True
+            tag = "🟢 TARGET X  "
+            last_target_time = time.time()
         else:
-            target_is_speaking = False
-            tag = "   BACKGROUND "
+            # Weak match: Only stay open if within HANG_TIME
+            if time.time() - last_target_time < HANG_TIME:
+                target_is_speaking = True
+                tag = "🟢 TARGET X  "
+            else:
+                target_is_speaking = False
+                tag = "   BACKGROUND"
 
-        print(f"\r{tag} sim_T={sim_t:+.2f} rms={rms:.4f}  ", end="", flush=True)
-        time.sleep(0.05)
+        if target_is_speaking != was_speaking:
+            if target_is_speaking:
+                print(f"\n{tag} (sim_T={sim_t:+.2f})")
+            else:
+                print(f"\n   Target X stopped  (sim_T={sim_t:+.2f})")
+            was_speaking = target_is_speaking
+
+        # Print detailed debug info on same line
+        print(f"\r{tag}  sim_T={sim_t:+.2f} rms={rms:.4f} infer={infer_time_ms:4.1f}ms   ", end="", flush=True)
+        time.sleep(0.01)
 
 
 # =====================================================================
@@ -261,7 +285,7 @@ def main():
     print(f"✓  FFT: {FFT_SIZE} samples, hop: {HOP_SIZE}")
 
     print("   Loading ECAPA-TDNN …")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     model = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         savedir=os.path.join(os.path.dirname(__file__), "..", "pretrained_models", "spkrec-ecapa-voxceleb"),
@@ -277,7 +301,9 @@ def main():
     t_ai = threading.Thread(target=inference_thread, args=(model, target_emb, device), daemon=True)
     t_ai.start()
 
-    print(f"\n🎤  Streaming — Threshold={THRESHOLD}, Ctrl-C to stop\n")
+    print(f"\n🎤  Ready to stream — Threshold={THRESHOLD}")
+    input("   Press Enter to start listening (Ctrl-C to stop) ...")
+    print("   Starting audio ...\n")
 
     with sd.Stream(samplerate=native_sr, blocksize=BLOCK_SIZE, channels=CHANNELS, dtype="float32", callback=audio_callback):
         try:
