@@ -127,6 +127,12 @@ async def stream(ws_url: str):
 
         # Output: pull from receive queue
         if len(recv_queue) > 0:
+            # If network jitter caused a burst of chunks, drop old ones to catch up to real-time
+            # This prevents a temporary network stutter from causing a persistent latency increase
+            while len(recv_queue) > JITTER_BUFFER_SIZE + 1:
+                recv_queue.popleft()
+                # You might log drops here if needed, but keeping it simple for now
+                
             processed = recv_queue.popleft()
             # Ensure correct length
             if len(processed) >= frames:
@@ -199,13 +205,12 @@ async def stream(ws_url: str):
                     print("🔊  Playback started (jitter buffer filled)")
 
     # ── Status printer ───────────────────────────────────────────
-    DISPLAY_THRESHOLD = 0.35  # Client-side threshold for display
-
     async def status_printer():
         while True:
             await asyncio.sleep(0.3)
             sim_max = max(stats['sim1'], stats['sim2'])
-            if sim_max > DISPLAY_THRESHOLD:
+            
+            if stats['target_active']:
                 indicator = f"\033[92m🟢 TARGET SPEAKING (sim={sim_max:.2f})\033[0m"
             elif sim_max > 0.05:
                 indicator = f"\033[91m🔴 background (sim={sim_max:.2f})\033[0m"

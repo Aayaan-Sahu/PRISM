@@ -99,8 +99,9 @@ MODEL_SR = 16_000
 CHUNK_SAMPLES = int(MODEL_SR * 0.15)
 CONTEXT_SAMPLES = int(MODEL_SR * 1.0)
 SIMILARITY_THRESHOLD = 0.35
-REJECT_GAIN = 0.05
-HOLD_CHUNKS = 5  # Hold gate open for 5 chunks (~750ms) after last target match
+HANG_THRESHOLD = 0.25      # Lower threshold to KEEP gate open
+HANG_TIME = 0.8            # Seconds to keep gate open after Target stops
+REJECT_GAIN = 0.00
 
 # ── Model state ──────────────────────────────────────────────────────
 sep_model = None
@@ -218,7 +219,10 @@ async def ws_endpoint(websocket: WebSocket):
     # 2. Streaming loop
     context_buf = torch.zeros(1, CONTEXT_SAMPLES, dtype=torch.float32, device=device)
     chunks_received = 0
-    gate_hold_remaining = 0  # Hysteresis: chunks remaining with gate open
+    
+    # Hysteresis state (per track)
+    track_is_target = [False, False]
+    track_last_time = [0.0, 0.0]
 
     try:
         while True:
@@ -263,19 +267,25 @@ async def ws_endpoint(websocket: WebSocket):
                     )
                     max_sims, _ = sims.max(dim=1)
 
-                    gains = torch.where(
-                        max_sims > SIMILARITY_THRESHOLD,
-                        torch.ones_like(max_sims),
-                        torch.full_like(max_sims, REJECT_GAIN),
-                    )
+                    t_now = time.time()
+                    gains = torch.full_like(max_sims, REJECT_GAIN)
 
-                    # Hysteresis: if any source matched, reset hold timer
-                    if (max_sims > SIMILARITY_THRESHOLD).any():
-                        gate_hold_remaining = HOLD_CHUNKS
-                    elif gate_hold_remaining > 0:
-                        # Hold period: keep all gains at 1.0
-                        gains = torch.ones_like(max_sims)
-                        gate_hold_remaining -= 1
+                    for i in range(2):
+                        sim_i = max_sims[i].item()
+                        if sim_i > SIMILARITY_THRESHOLD:
+                            track_is_target[i] = True
+                            track_last_time[i] = t_now
+                        elif track_is_target[i] and sim_i > HANG_THRESHOLD:
+                            track_is_target[i] = True
+                            track_last_time[i] = t_now
+                        else:
+                            if t_now - track_last_time[i] < HANG_TIME:
+                                track_is_target[i] = True
+                            else:
+                                track_is_target[i] = False
+
+                        if track_is_target[i]:
+                            gains[i] = 1.0
 
                     output = gains[0] * src1 + gains[1] * src2
                     output = torch.clamp(output, -1.0, 1.0)
