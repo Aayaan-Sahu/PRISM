@@ -43,7 +43,7 @@ CHANNELS = 1
 CHUNK_DURATION = 0.34      # trailing window
 RECENT_DURATION = 0.15     # Short chunk for interrupt detection
 CHUNK_HOP = 0.05           # AI analysis hop (seconds)
-THRESHOLD = 0.28           # Higher threshold prevents false positives (e.g. your friend)
+THRESHOLD = 0.3           # Higher threshold prevents false positives (e.g. your friend)
 HANG_THRESHOLD = 0.25      # Lower threshold to KEEP gate open if it was already open
 HANG_TIME = 0.8            # Seconds to keep gate open after Target X stops speaking
 
