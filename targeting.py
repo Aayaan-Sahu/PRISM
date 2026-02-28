@@ -7,6 +7,9 @@ angle in degrees.
 
   -30 °  ←  left edge       0 °  ← centre       +30 °  →  right edge
 
+Face lock:  press L to lock onto the current target and start a 5-second
+recording.  Press L again to unlock early.
+
 Usage (standalone):
     python targeting.py
 
@@ -31,6 +34,10 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+from face_lock import FaceLock, FaceSnapshot, LockState
+from recorder import AVRecorder, save_clip
+from dolphin_preprocess import preprocess_for_dolphin
+
 # ── model ──────────────────────────────────────────────────────────────────
 _MODEL_PATH = "blaze_face_short_range.tflite"
 _MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
@@ -48,6 +55,12 @@ CROSSHAIR_HALF: int = 20        # pixels for static crosshair arms
 COLOR_TARGET   = (0,   255,   0)   # bright green
 COLOR_BG_FACE  = (160, 160, 160)   # grey
 COLOR_CROSS    = (255, 255, 255)   # white
+COLOR_LOCKED   = (255, 255,   0)   # cyan (BGR)
+COLOR_REC      = (0,     0, 255)   # red (BGR)
+COLOR_LOST     = (0,     0, 255)   # red (BGR)
+
+# Output directory for recordings
+_RECORDINGS_DIR = os.path.join(".", "recordings", "latest")
 
 
 # ── MediaPipe nose-tip keypoint index ─────────────────────────────────────
@@ -104,6 +117,12 @@ class TargetingSystem:
         self._lock = threading.Lock()
         self._current_angle: float | None = None
 
+        # face lock-on
+        self._face_lock = FaceLock()
+
+        # A/V recorder
+        self._recorder = AVRecorder()
+
     # ── context manager ───────────────────────────────────────────────────
 
     def __enter__(self) -> "TargetingSystem":
@@ -128,6 +147,8 @@ class TargetingSystem:
         self._detector = mp_vision.FaceDetector.create_from_options(options)
 
     def close(self) -> None:
+        if self._recorder.is_recording:
+            self._recorder.cancel()
         if self._cap is not None:
             self._cap.release()
         self._detector = None
@@ -156,6 +177,61 @@ class TargetingSystem:
         for _ in self._run_capture_loop(display=False):
             yield self.current_angle
 
+    # ── key handling ──────────────────────────────────────────────────────
+
+    def _handle_key(self, key: int, detections, frame_h: int, frame_w: int) -> bool:
+        """Handle keyboard input. Returns True if should quit."""
+        if key == ord("q") or key == 27:  # q or Esc
+            return True
+
+        if key == ord("l") or key == ord("L"):
+            if self._face_lock.state == LockState.UNLOCKED:
+                # Lock onto current target and start recording
+                self._try_lock_and_record(detections, frame_h, frame_w)
+            else:
+                # Unlock and stop recording
+                self._unlock_and_stop()
+
+        return False
+
+    def _try_lock_and_record(self, detections, frame_h: int, frame_w: int) -> None:
+        """Lock onto the closest-to-center face and start recording."""
+        if not detections:
+            return
+
+        # Find closest to center
+        best = min(
+            detections,
+            key=lambda d: abs(d.keypoints[_NOSE_TIP_IDX].x - CENTER_X),
+        )
+        snapshot = FaceSnapshot.from_detection(best, frame_h, frame_w)
+        self._face_lock.lock(snapshot)
+        self._recorder.start()
+        print("\n[LOCK] Locked onto face — recording 5 seconds...")
+
+    def _unlock_and_stop(self) -> None:
+        """Unlock face and stop recording."""
+        self._face_lock.unlock()
+        if self._recorder.is_recording:
+            clip = self._recorder.finish()
+            print("\n[UNLOCK] Early unlock — saving partial recording...")
+            self._save_recording(clip)
+        else:
+            print("\n[UNLOCK] Released lock.")
+
+    def _save_recording(self, clip) -> None:
+        """Save clip and run Dolphin preprocessing in background thread."""
+        def _save():
+            raw_dir = os.path.join(_RECORDINGS_DIR, "raw")
+            dolphin_dir = os.path.join(_RECORDINGS_DIR, "dolphin")
+            save_clip(clip, raw_dir)
+            print(f"[SAVE] Raw clip saved to {raw_dir}")
+            preprocess_for_dolphin(clip, dolphin_dir)
+            print(f"[SAVE] Dolphin-ready output saved to {dolphin_dir}")
+
+        t = threading.Thread(target=_save, daemon=True)
+        t.start()
+
     # ── internal capture loop ─────────────────────────────────────────────
 
     def _run_capture_loop(self, display: bool = True) -> Iterator[None]:
@@ -175,7 +251,10 @@ class TargetingSystem:
             if display:
                 cv2.imshow("Targeting System", frame)
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or key == 27:   # q or Esc to quit
+
+                # Gather current detections for key handler
+                # (re-use cached detections from _process_frame)
+                if self._handle_key(key, self._last_detections, *frame.shape[:2]):
                     break
 
             yield   # hand control back (allows stream() to yield angle)
@@ -192,21 +271,59 @@ class TargetingSystem:
         if draw:
             _draw_crosshair(frame, cx, cy)
 
-        if not results.detections:
+        detections = results.detections if results.detections else []
+        self._last_detections = detections  # cache for key handler
+
+        if not detections:
+            # No faces — update lock state
+            if self._face_lock.state == LockState.LOCKED:
+                self._face_lock.match([])  # increment lost counter
+
+                # Check if lock was just lost
+                if self._face_lock.state == LockState.LOST:
+                    self._on_lock_lost(draw, frame, h, w)
+
+            if draw and self._face_lock.state == LockState.LOST:
+                cv2.putText(frame, "LOCK LOST", (cx - 60, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLOR_LOST, 2, cv2.LINE_AA)
+
             return None
 
-        # ── find target: face whose nose_x is closest to 0.5 ─────────────
-        best = min(
-            results.detections,
-            key=lambda d: abs(d.keypoints[_NOSE_TIP_IDX].x - CENTER_X),
-        )
+        # ── determine target face ─────────────────────────────────────────
+        target_det = None
+        is_locked = self._face_lock.state in (LockState.LOCKED, LockState.LOST)
 
+        if is_locked:
+            # Build snapshots for all candidates
+            snapshots = [FaceSnapshot.from_detection(d, h, w) for d in detections]
+            match_idx = self._face_lock.match(snapshots)
+
+            if match_idx is not None:
+                target_det = detections[match_idx]
+            elif self._face_lock.state == LockState.LOST:
+                self._on_lock_lost(draw, frame, h, w)
+        else:
+            # Default: closest to center
+            target_det = min(
+                detections,
+                key=lambda d: abs(d.keypoints[_NOSE_TIP_IDX].x - CENTER_X),
+            )
+
+        # ── draw all faces + compute angle ────────────────────────────────
         target_angle: float | None = None
 
-        for det in results.detections:
-            is_target = det is best
-            color = COLOR_TARGET if is_target else COLOR_BG_FACE
-            thickness = 2 if is_target else 1
+        for det in detections:
+            is_target = det is target_det
+
+            if is_target and self._face_lock.state == LockState.LOCKED:
+                color = COLOR_LOCKED
+                thickness = 3
+            elif is_target:
+                color = COLOR_TARGET
+                thickness = 2
+            else:
+                color = COLOR_BG_FACE
+                thickness = 1
 
             kp = det.keypoints[_NOSE_TIP_IDX]
             nose_x, nose_y = kp.x, kp.y
@@ -218,30 +335,74 @@ class TargetingSystem:
             if is_target:
                 target_angle = _angle_from_nose_x(nose_x)
                 sign = "+" if target_angle >= 0 else ""
-                label = f"Target: {sign}{target_angle:.1f} deg"
+
+                if self._face_lock.state == LockState.LOCKED:
+                    label = f"LOCKED: {sign}{target_angle:.1f} deg"
+                else:
+                    label = f"Target: {sign}{target_angle:.1f} deg"
 
                 if draw:
-                    # green dot on nose
-                    cv2.circle(frame, (nx, ny), 5, COLOR_TARGET, -1, cv2.LINE_AA)
-                    # label above bounding box
+                    cv2.circle(frame, (nx, ny), 5, color, -1, cv2.LINE_AA)
                     cv2.putText(
                         frame, label,
                         (x1, max(y1 - 8, 16)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        COLOR_TARGET, 2, cv2.LINE_AA,
+                        color, 2, cv2.LINE_AA,
                     )
             else:
                 if draw:
-                    # small grey dot on non-target nose
                     cv2.circle(frame, (nx, ny), 3, COLOR_BG_FACE, -1, cv2.LINE_AA)
 
+        # ── recording ─────────────────────────────────────────────────────
+        if self._recorder.is_recording:
+            # Push frame to recorder (with locked face's detection)
+            self._recorder.push_frame(frame, target_det)
+
+            if draw:
+                self._draw_rec_indicator(frame, w)
+
+            # Check if recording is complete
+            if self._recorder.is_done:
+                clip = self._recorder.finish()
+                self._face_lock.unlock()
+                print("\n[REC] 5-second recording complete!")
+                self._save_recording(clip)
+
+        # Show LOCK LOST overlay
+        if draw and self._face_lock.state == LockState.LOST:
+            cv2.putText(frame, "LOCK LOST", (cx - 60, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLOR_LOST, 2, cv2.LINE_AA)
+
         return target_angle
+
+    def _draw_rec_indicator(self, frame, frame_w: int) -> None:
+        """Draw red REC dot and elapsed time in top-right corner."""
+        elapsed = self._recorder.elapsed
+        remaining = max(0.0, 5.0 - elapsed)
+
+        # Red circle (REC dot)
+        dot_x = frame_w - 80
+        dot_y = 30
+        cv2.circle(frame, (dot_x, dot_y), 8, COLOR_REC, -1, cv2.LINE_AA)
+
+        # Time text
+        text = f"REC {remaining:.1f}s"
+        cv2.putText(frame, text, (dot_x + 14, dot_y + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_REC, 2, cv2.LINE_AA)
+
+    def _on_lock_lost(self, draw: bool, frame, h: int, w: int) -> None:
+        """Handle transition to LOST state."""
+        if self._recorder.is_recording:
+            clip = self._recorder.finish()
+            print("\n[LOST] Lock lost — saving partial recording...")
+            self._save_recording(clip)
+            self._face_lock.unlock()
 
 
 # ── standalone entry-point ────────────────────────────────────────────────
 
 def main() -> None:
-    print("Targeting System  |  press Q or Esc to quit")
+    print("Targeting System  |  L = lock/unlock + record  |  Q/Esc = quit")
     try:
         with TargetingSystem(camera_index=0) as ts:
             for _ in ts._run_capture_loop(display=True):
