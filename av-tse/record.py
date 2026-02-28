@@ -2,7 +2,7 @@
 AV-TSE Recorder — spacebar-triggered synchronized video + audio capture.
 
 Opens the webcam with the FaceMesh targeting overlay and the microphone array.
-Press SPACEBAR to start recording.  Press SPACEBAR again (or wait for max
+Press 'i' to start recording.  Press 'i' again (or wait for max
 duration) to stop.  Saves a single .mp4 containing the full-frame video
 at 25 FPS and the mixed microphone audio at 16 kHz mono — exactly the
 format Dolphin expects.
@@ -46,7 +46,7 @@ def _downsample_to_mono(chunk_4ch: np.ndarray) -> np.ndarray:
 
 
 class Recorder:
-    """Synchronized video + audio recorder with spacebar trigger."""
+    """Synchronized video + audio recorder with 'i' key trigger."""
 
     def __init__(self, output_path: str, camera_index: int = 0):
         self.output_path = output_path
@@ -74,9 +74,9 @@ class Recorder:
     # ── Main loop ─────────────────────────────────────────────────────────
 
     def run(self):
-        cap = cv2.VideoCapture(self.camera_index)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {self.camera_index}")
+        from targeting import LipTargetingSystem
+        ts = LipTargetingSystem(self.camera_index)
+        ts.open()
 
         # Start audio stream (always listening, only buffering when recording)
         self._audio_stream = sd.InputStream(
@@ -91,7 +91,7 @@ class Recorder:
 
         print("╔══════════════════════════════════════════════════╗")
         print("║  AV-TSE Recorder                                ║")
-        print("║  Press SPACEBAR to START / STOP recording.       ║")
+        print("║  Press 'i' to START / STOP recording.            ║")
         print("║  Press Q or ESC to quit without saving.          ║")
         print("╚══════════════════════════════════════════════════╝")
 
@@ -99,10 +99,16 @@ class Recorder:
         record_stop = None
 
         try:
+            last_face_crop = None
             while not self.done:
-                ok, frame = cap.read()
+                ok, frame = ts._cap.read()
                 if not ok:
                     break
+
+                angle, lip_crop, face_crop = ts._process_frame(frame, draw=True)
+                
+                if face_crop is not None:
+                    last_face_crop = face_crop.copy()
 
                 # Overlay status text
                 if self.recording:
@@ -113,7 +119,11 @@ class Recorder:
                     cv2.circle(frame, (frame.shape[1] - 25, 25), 10, (0, 0, 255), -1)
 
                     # Capture frame for recording
-                    self._video_frames.append(frame.copy())
+                    if last_face_crop is not None:
+                        self._video_frames.append(last_face_crop.copy())
+                    else:
+                        # Fallback if no face ever detected (rare)
+                        self._video_frames.append(cv2.resize(frame, (512, 512)))
 
                     # Auto-stop
                     if elapsed >= MAX_RECORD_SEC:
@@ -122,23 +132,25 @@ class Recorder:
                         record_stop = time.time()
                         self.done = True
                 else:
-                    cv2.putText(frame, "STANDBY — press SPACE to record", (10, 30),
+                    cv2.putText(frame, "STANDBY — press 'i' to record", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 cv2.imshow("AV-TSE Recorder", frame)
                 key = cv2.waitKey(1) & 0xFF
 
-                if key == ord(" "):
+                if key == ord("i"):
                     if not self.recording:
                         # START recording
                         self.recording = True
+                        ts.is_locked = True
                         record_start = time.time()
                         self._video_frames.clear()
                         self._audio_chunks.clear()
-                        print("[Recorder] ● Recording started. Press SPACE to stop.")
+                        print("[Recorder] ● Recording started. Press 'i' to stop.")
                     else:
                         # STOP recording
                         self.recording = False
+                        ts.is_locked = False
                         record_stop = time.time()
                         self.done = True
                         print("[Recorder] ■ Recording stopped.")
@@ -151,8 +163,7 @@ class Recorder:
         finally:
             self._audio_stream.stop()
             self._audio_stream.close()
-            cap.release()
-            cv2.destroyAllWindows()
+            ts.close()
 
         # ── Save ──────────────────────────────────────────────────────────
         if not self._video_frames:

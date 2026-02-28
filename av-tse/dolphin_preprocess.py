@@ -158,4 +158,3 @@ def preprocess_for_dolphin(clip: RecordedClip, output_dir: str) -> tuple[str, st
 
     return video_path, audio_path
 
-
