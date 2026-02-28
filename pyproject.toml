@@ -1,0 +1,18 @@
+[project]
+name = "spatial-audio-recognition"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface-hub<1.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "requests>=2.32.5",
+    "scipy>=1.15.3",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.13.1",
+    "speechbrain>=1.0.3",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+]
