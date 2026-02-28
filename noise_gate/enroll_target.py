@@ -27,7 +27,6 @@ from speechbrain.inference.speaker import EncoderClassifier
 DURATION = 5          # seconds (as requested)
 SAMPLE_RATE = 16_000  # record at 16 kHz directly (model rate)
 CHANNELS = 1
-TARGET_PATH = os.path.join(os.path.dirname(__file__), "target.npy")
 
 
 def record_and_save(model: EncoderClassifier, device: torch.device, name: str, output_path: str):
@@ -66,8 +65,16 @@ def main() -> None:
     )
     print(f"✓  Model loaded on {device}\n")
 
-    print("--- Enrolling Person X (Target) ---")
-    record_and_save(model, device, "Target", TARGET_PATH)
+    print("--- Enrolling New Person ---")
+    name = input("What is the name of the user you want to enroll?: ").strip()
+    if not name:
+        name = "Target"
+    
+    emb_dir = os.path.join(os.path.dirname(__file__), "embeddings")
+    os.makedirs(emb_dir, exist_ok=True)
+    target_path = os.path.join(emb_dir, f"{name}.npy")
+
+    record_and_save(model, device, name, target_path)
 
     print(f"Enrollment complete. You can now run:  uv run python noise_gate/target_speaker_vad.py")
 

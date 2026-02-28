@@ -40,26 +40,27 @@ SAMPLE_RATE = 16_000       # Record at model rate for simplicity
 CHANNELS = 1
 
 # Speaker-ID gating
-CHUNK_DURATION = 0.30      # trailing window
+CHUNK_DURATION = 0.34      # trailing window
+RECENT_DURATION = 0.15     # Short chunk for interrupt detection
 CHUNK_HOP = 0.05           # AI analysis hop (seconds)
 THRESHOLD = 0.28           # Higher threshold prevents false positives (e.g. your friend)
 HANG_THRESHOLD = 0.25      # Lower threshold to KEEP gate open if it was already open
-HANG_TIME = 0.4            # Seconds to keep gate open after Target X stops speaking
+HANG_TIME = 0.8            # Seconds to keep gate open after Target X stops speaking
 
 # Spectral processing
 FFT_SIZE = 1024
 HOP_SIZE = 512
 
 TARGET_GAIN = 2.5          # Amplification for Target X
-OVERSUBTRACT_TARGET = 4.0  # Reduced from 6.0 to prevent muffling Target X's voice
+OVERSUBTRACT_TARGET = 1.5  # Heavy penalty against Background Y's profile
 OVERSUBTRACT_BG = 0.0      # NO noise removal when nobody speaks (normal background)
 BG_GAIN = 1.0              # Normal listening volume for background
-SPECTRAL_FLOOR = 0.01      # Minimum fraction of original magnitude kept
+SPECTRAL_FLOOR = 0.05      # 5% safety net to prevent muffling Target X's harmonics
 
 NOISE_EMA = 0.95           # Exponential moving average for noise estimate
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..")
-TARGET_NPY = os.path.join(os.path.dirname(__file__), "..", "noise_gate", "target.npy")
+EMBEDDINGS_DIR = os.path.join(os.path.dirname(__file__), "..", "noise_gate", "embeddings")
 
 def save_wav(path: str, audio: np.ndarray, sr: int) -> None:
     """Save float32 numpy → 16-bit WAV."""
@@ -150,7 +151,7 @@ def main():
     print("=" * 60)
 
     print("\n  Loading ECAPA-TDNN …")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     model = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         savedir=os.path.join(os.path.dirname(__file__), "..",
@@ -159,12 +160,21 @@ def main():
     )
     print(f"  ✓  Model on {device}")
 
-    if not os.path.exists(TARGET_NPY):
-        print(f"\n❌  target.npy missing. Run noise_gate/enroll_target.py first.")
+    if not os.path.exists(EMBEDDINGS_DIR) or not any(f.endswith(".npy") for f in os.listdir(EMBEDDINGS_DIR)):
+        print(f"\n❌  No target embeddings found in {EMBEDDINGS_DIR}!")
+        print("   Run:  uv run python noise_gate/enroll_target.py first")
         sys.exit(1)
 
-    target_emb = torch.from_numpy(np.load(TARGET_NPY)).float().to(device)
-    print("  ✓  Loaded target.npy embedding.")
+    target_list = []
+    target_names = []
+    for f in sorted(os.listdir(EMBEDDINGS_DIR)):
+        if f.endswith(".npy"):
+            target_list.append(np.load(os.path.join(EMBEDDINGS_DIR, f)))
+            target_names.append(f[:-4])
+            
+    target_np = np.stack(target_list)
+    target_emb = torch.from_numpy(target_np).float().to(device)
+    print(f"  ✓  Loaded target embeddings for {len(target_list)} users: {', '.join(target_names)}")
 
     print(f"\n── STEP 1 & 2: Record {RECORD_DURATION}s and Live Classify ──")
     print("  TIP: alternate between NOISE and TARGET X.")
@@ -209,13 +219,26 @@ def main():
                 sim_t = 0.0
             else:
                 chunk_clean = nr.reduce_noise(y=chunk, sr=SAMPLE_RATE, stationary=True, prop_decrease=0.9)
-                ct = torch.from_numpy(chunk_clean).unsqueeze(0).float().to(device)
+                ct_full = torch.from_numpy(chunk_clean).unsqueeze(0).float().to(device)
+                
+                recent_samples = int(RECENT_DURATION * SAMPLE_RATE)
+                ct_recent = ct_full[:, -recent_samples:]
+                
+                pad_len = ct_full.shape[1] - ct_recent.shape[1]
+                ct_recent_padded = torch.nn.functional.pad(ct_recent, (pad_len, 0))
+                
+                batch = torch.cat([ct_full, ct_recent_padded], dim=0)
                 
                 t0 = time.perf_counter()
                 with torch.no_grad():
-                    ce = model.encode_batch(ct).squeeze()
+                    ce = model.encode_batch(batch).squeeze()
                     
-                sim_t = torch.nn.functional.cosine_similarity(ce.unsqueeze(0), target_emb.unsqueeze(0)).item()
+                # Compare both audio embeddings to all stored Target embeddings
+                # ce shape is [2, 192] -> unsqueeze to [2, 1, 192]
+                # target_emb is [N, 192] -> unsqueeze to [1, N, 192]
+                # output is [2, N]
+                sims = torch.nn.functional.cosine_similarity(ce.unsqueeze(1), target_emb.unsqueeze(0), dim=-1)
+                sim_t = sims.max().item()
                 infer_time_ms = (time.perf_counter() - t0) * 1000.0
                 
                 # Logic with Hysteresis & Dual Thresholds

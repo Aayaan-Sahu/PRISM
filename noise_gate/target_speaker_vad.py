@@ -41,7 +41,8 @@ BLOCK_SIZE = 512           # Audio callback frame size (≈ 10 ms at 48 kHz)
 FFT_SIZE = 1024            # STFT window length (≈ 21 ms at 48 kHz)
 HOP_SIZE = BLOCK_SIZE      # STFT hop = callback frame size (50 % overlap)
 
-BUFFER_DURATION = 0.3      # Ring-buffer length for AI thread (90ms trailing)
+BUFFER_DURATION = 0.34     # Ring-buffer length for AI thread (340ms trailing)
+RECENT_DURATION = 0.15     # Short chunk for interrupt detection (150ms)
 CHANNELS = 1               # Mono
 MODEL_SR = 16_000          # SpeechBrain expected sample rate
 
@@ -49,12 +50,12 @@ MODEL_SR = 16_000          # SpeechBrain expected sample rate
 THRESHOLD = 0.28           # Higher threshold prevents false positives (e.g. your friend)
 HANG_THRESHOLD = 0.25      # Lower threshold to KEEP gate open if it was already open
 RMS_THRESHOLD = 5e-4       # Minimum loudness to bother running AI model
-HANG_TIME = 0.5            # Seconds to keep gate open after Target X stops speaking
+HANG_TIME = 0.8            # Seconds to keep gate open after Target X stops speaking
 
 # Spectral processing
 TARGET_GAIN = 2.5          # Amplification for Target X
-OVERSUBTRACT_TARGET = 4.0  # Reduced from 6.0 to prevent muffling Target X's voice
-SPECTRAL_FLOOR = 0.01      # Minimum fraction of original magnitude kept
+OVERSUBTRACT_TARGET = 1.5  # Heaby penalty against Background Y's profile
+SPECTRAL_FLOOR = 0.05      # 5% safety net to prevent muffling Target X's harmonics
 
 OVERSUBTRACT_BG = 0.0      # NO noise suppression when nobody is speaking (normal background)
 BG_GAIN = 1.0              # Normal listening volume for background
@@ -65,7 +66,7 @@ NOISE_EMA = 0.95           # EMA factor for noise estimate (background tracking)
 TRANSITION_ATTACK = 0.05   # Seconds to transition states
 TRANSITION_RELEASE = 0.25
 
-TARGET_PATH = os.path.join(os.path.dirname(__file__), "target.npy")
+EMBEDDINGS_DIR = os.path.join(os.path.dirname(__file__), "embeddings")
 
 # =====================================================================
 # Global Shared State
@@ -219,13 +220,54 @@ def inference_thread(model: EncoderClassifier, target_emb: torch.Tensor, device:
             continue
 
         waveform = torch.from_numpy(snapshot).unsqueeze(0).float().to(device)
+
+        # 1. GPU-Accelerated Zero-Shot Noise Suppression
+        # Instead of feeding raw mic (which contains Speaker Y), we subtract the ambient `noise_spectrum`
+        # which has already learned what Speaker Y sounds like.
+        if noise_ready and noise_spectrum is not None:
+            # Reconstruct noise to match GPU device / dtype
+            ns = torch.from_numpy(noise_spectrum).float().to(device)
+            
+            # STFT on native sample rate audio before resampler!
+            window_t = torch.hann_window(FFT_SIZE, device=device)
+            stft = torch.stft(waveform, n_fft=FFT_SIZE, hop_length=HOP_SIZE, window=window_t, return_complex=True)
+            mag = stft.abs()
+            phase = stft.angle()
+            
+            # Subtract noise
+            ns_exp = ns.unsqueeze(0).unsqueeze(2)
+            clean_mag = torch.maximum(mag - OVERSUBTRACT_TARGET * ns_exp, SPECTRAL_FLOOR * mag)
+            clean_stft = clean_mag * torch.exp(1j * phase)
+            
+            # ISTFT
+            waveform = torch.istft(clean_stft, n_fft=FFT_SIZE, hop_length=HOP_SIZE, window=window_t, length=waveform.shape[1])
+
+        # 2. Resample cleaned audio to 16k
         waveform_16k = resampler(waveform)
+
+        # 3. Dual-Window Analysis (Full 340ms vs Recent 150ms)
+        # Allows Target X to instantly trigger the gate when interrupting Speaker Y
+        recent_samples = int(RECENT_DURATION * MODEL_SR)
+        
+        chunk_full = waveform_16k
+        chunk_recent = waveform_16k[:, -recent_samples:]
+        
+        # Pad chunk_recent so it has the same length as chunk_full
+        pad_len = chunk_full.shape[1] - chunk_recent.shape[1]
+        chunk_recent_padded = torch.nn.functional.pad(chunk_recent, (pad_len, 0))
+        
+        batch = torch.cat([chunk_full, chunk_recent_padded], dim=0)
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            emb = model.encode_batch(waveform_16k).squeeze()
+            emb = model.encode_batch(batch).squeeze()
 
-        sim_t = torch.nn.functional.cosine_similarity(emb.unsqueeze(0), target_emb.unsqueeze(0)).item()
+        # Compare both audio embeddings to all stored Target embeddings
+        # emb shape is [2, 192] -> unsqueeze to [2, 1, 192]
+        # target_emb is [N, 192] -> unsqueeze to [1, N, 192]
+        # output is [2, N]
+        sims = torch.nn.functional.cosine_similarity(emb.unsqueeze(1), target_emb.unsqueeze(0), dim=-1)
+        sim_t = sims.max().item()
         current_sim_t = sim_t
         infer_time_ms = (time.perf_counter() - t0) * 1000.0  # Decision Logic
         
@@ -268,13 +310,20 @@ def inference_thread(model: EncoderClassifier, target_emb: torch.Tensor, device:
 def main():
     global ring_buffer, native_sr, window
 
-    if not os.path.exists(TARGET_PATH):
-        print(f"❌  target.npy not found!")
+    if not os.path.exists(EMBEDDINGS_DIR) or not any(f.endswith(".npy") for f in os.listdir(EMBEDDINGS_DIR)):
+        print(f"❌  No target embeddings found in {EMBEDDINGS_DIR}!")
         print("   Run:  uv run python noise_gate/enroll_target.py")
         sys.exit(1)
 
-    target_np = np.load(TARGET_PATH)
-    print(f"✓  Target X embedding loaded ({target_np.shape[0]}-d)")
+    target_list = []
+    target_names = []
+    for f in sorted(os.listdir(EMBEDDINGS_DIR)):
+        if f.endswith(".npy"):
+            target_list.append(np.load(os.path.join(EMBEDDINGS_DIR, f)))
+            target_names.append(f[:-4])
+            
+    target_np = np.stack(target_list) # shape: (N, 192)
+    print(f"✓  Loaded target embeddings for {len(target_list)} users: {', '.join(target_names)}")
 
     dev_info = sd.query_devices(kind="input")
     native_sr = int(dev_info["default_samplerate"])
@@ -293,7 +342,7 @@ def main():
     )
     print(f"✓  Model loaded on {device}")
 
-    target_emb = torch.from_numpy(target_np).float().to(device)
+    target_emb = torch.from_numpy(target_np).float().to(device) # shape: [N, 192]
 
     t_spec = threading.Thread(target=spectral_thread, daemon=True)
     t_spec.start()
