@@ -4,4 +4,14 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "huggingface-hub<1.0",
+    "noisereduce>=3.0.3",
+    "pyrnnoise>=0.4.3",
+    "requests>=2.32.5",
+    "sounddevice>=0.5.5",
+    "speechbrain>=1.0.0",
+    "torch>=2.5",
+    "torchaudio>=2.5",
+    "torchcodec>=0.10.0",
+]
