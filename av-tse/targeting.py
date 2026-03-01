@@ -63,7 +63,7 @@ class LipTargetingSystem:
     Wraps a webcam + MediaPipe FaceDetector to extract faces.
     """
 
-    def __init__(self, camera_index: int = 0) -> None:
+    def __init__(self, camera_index: int | None = None) -> None:
         self._camera_index = camera_index
         self._cap: cv2.VideoCapture | None = None
         
@@ -93,9 +93,22 @@ class LipTargetingSystem:
 
     def open(self) -> None:
         _ensure_model()
-        self._cap = cv2.VideoCapture(self._camera_index)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {self._camera_index}")
+        
+        if self._camera_index is not None:
+            self._cap = cv2.VideoCapture(self._camera_index)
+            if not self._cap.isOpened():
+                raise RuntimeError(f"Cannot open camera {self._camera_index}")
+        else:
+            # Auto-detect: try index 1 (usually external USB webcam) then 0 (internal)
+            self._cap = cv2.VideoCapture(1)
+            if self._cap.isOpened():
+                print("[Camera] Auto-selected external camera (index 1)")
+            else:
+                self._cap = cv2.VideoCapture(0)
+                if self._cap.isOpened():
+                    print("[Camera] Auto-selected internal camera (index 0)")
+                else:
+                    raise RuntimeError("Could not open any camera (tried 1 and 0)")
         
         base_options = mp_python.BaseOptions(model_asset_path=_MODEL_PATH)
         options = mp_vision.FaceDetectorOptions(
@@ -263,7 +276,7 @@ class LipTargetingSystem:
 def main() -> None:
     print("AV-TSE Target Setup  |  press Q or Esc to quit")
     try:
-        with LipTargetingSystem(camera_index=0) as ts:
+        with LipTargetingSystem(camera_index=None) as ts:
             for _ in ts._run_capture_loop(display=True):
                 angle, lip_crop, face_crop = ts.current_target_data
                 if angle is not None and face_crop is not None:

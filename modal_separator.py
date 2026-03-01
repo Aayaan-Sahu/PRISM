@@ -198,7 +198,10 @@ async def ws_endpoint(websocket: WebSocket):
 
         emb_list = init_msg["embeddings"]
         n_speakers = len(emb_list)
-        target_emb = torch.tensor(emb_list, dtype=torch.float32, device=device)
+        if n_speakers > 0:
+            target_emb = torch.tensor(emb_list, dtype=torch.float32, device=device)
+        else:
+            target_emb = torch.empty((0, 192), dtype=torch.float32, device=device)
         print(f"Loaded {n_speakers} target embedding(s)", flush=True)
 
         await websocket.send_text(json.dumps({
@@ -226,7 +229,29 @@ async def ws_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            raw = await websocket.receive_bytes()
+            msg = await websocket.receive()
+            
+            if "text" in msg and msg["text"]:
+                # Hot-reload JSON message
+                try:
+                    reload_msg = json.loads(msg["text"])
+                    if reload_msg.get("type") == "init":
+                        emb_list = reload_msg.get("embeddings", [])
+                        n_speakers = len(emb_list)
+                        if n_speakers > 0:
+                            target_emb = torch.tensor(emb_list, dtype=torch.float32, device=device)
+                        else:
+                            # If they send 0 embeddings, just make an empty tensor
+                            target_emb = torch.empty((0, 192), dtype=torch.float32, device=device)
+                        print(f"🔥 HOT RELOAD: Updated to {n_speakers} target(s)", flush=True)
+                except Exception as e:
+                    print(f"Hot reload error: {e}", flush=True)
+                continue
+                
+            if "bytes" not in msg or not msg["bytes"]:
+                continue
+                
+            raw = msg["bytes"]
             t0 = time.perf_counter()
 
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
@@ -262,10 +287,14 @@ async def ws_endpoint(websocket: WebSocket):
 
                     src_embeddings = ecapa_model.encode_batch(sources_for_ecapa).squeeze(1)
 
-                    sims = torch.nn.functional.cosine_similarity(
-                        src_embeddings.unsqueeze(1), target_emb.unsqueeze(0), dim=-1
-                    )
-                    max_sims, _ = sims.max(dim=1)
+                    if n_speakers > 0:
+                        sims = torch.nn.functional.cosine_similarity(
+                            src_embeddings.unsqueeze(1), target_emb.unsqueeze(0), dim=-1
+                        )
+                        max_sims, _ = sims.max(dim=1)
+                    else:
+                        # No enrolled speakers -> everything is rejected
+                        max_sims = torch.zeros(2, device=device)
 
                     t_now = time.time()
                     gains = torch.full_like(max_sims, REJECT_GAIN)

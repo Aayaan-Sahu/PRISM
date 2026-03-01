@@ -28,9 +28,26 @@ import soundfile as sf
 
 print(sd.query_devices())
 
+def _get_best_mic() -> tuple[int | None, int]:
+    """Find the 'onn.' webcam mic if available, else default. Returns (index, channels)."""
+    try:
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d['max_input_channels'] > 0 and 'onn' in d['name'].lower():
+                print(f"[Audio] Auto-selected {d['name']} (index {i}, {d['max_input_channels']} ch)")
+                return i, int(d['max_input_channels'])
+        # Fallback to default
+        idx = sd.default.device[0]
+        if idx is not None:
+            ch = int(devices[idx]['max_input_channels'])
+            print(f"[Audio] Falling back to default mic (index {idx}, {ch} ch)")
+            return None, ch
+    except Exception as e:
+        print(f"[Audio] Warning: failed to query devices: {e}")
+    return None, 1  # Safe ultimate fallback
+
 # ── Configuration ──────────────────────────────────────────────────────────
-AGG_DEVICE_INDEX = None       # None means system default microphone
-CHS = 1                       # 1 channel (mono) for generic mic
+AGG_DEVICE_INDEX, CHS = _get_best_mic()
 NATIVE_SR = 48_000            # typical native mic sample rate (we will resample)
 TARGET_SR = 16_000            # Dolphin audio input rate
 TARGET_FPS = 25               # Dolphin video input rate
@@ -53,7 +70,7 @@ def _downsample_to_mono(chunk: np.ndarray) -> np.ndarray:
 class Recorder:
     """Synchronized video + audio recorder with 'i' key trigger."""
 
-    def __init__(self, output_path: str, camera_index: int = 0):
+    def __init__(self, output_path: str, camera_index: int | None = None):
         self.output_path = output_path
         self.camera_index = camera_index
 
