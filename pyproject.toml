@@ -29,4 +29,6 @@ dependencies = [
     "torchaudio==2.8.0",
     "torchvision>=0.23.0",
     "vector-quantize-pytorch>=1.27.21",
+    "fastapi",
+    "websockets",
 ]
