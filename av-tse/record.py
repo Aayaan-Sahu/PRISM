@@ -28,27 +28,49 @@ import soundfile as sf
 
 print(sd.query_devices())
 
+def _get_best_mic() -> tuple[int | None, int]:
+    """Find the 'onn.' webcam mic if available, else default. Returns (index, channels)."""
+    try:
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d['max_input_channels'] > 0 and 'onn' in d['name'].lower():
+                print(f"[Audio] Auto-selected {d['name']} (index {i}, {d['max_input_channels']} ch)")
+                return i, int(d['max_input_channels'])
+        # Fallback to default
+        idx = sd.default.device[0]
+        if idx is not None:
+            ch = int(devices[idx]['max_input_channels'])
+            print(f"[Audio] Falling back to default mic (index {idx}, {ch} ch)")
+            return None, ch
+    except Exception as e:
+        print(f"[Audio] Warning: failed to query devices: {e}")
+    return None, 1  # Safe ultimate fallback
+
 # ── Configuration ──────────────────────────────────────────────────────────
-AGG_DEVICE_INDEX = 9          # macOS Aggregate Device (4 in, 0 out)
-CHS = 4                       # 2 channels per Yeti × 2 Yetis
-NATIVE_SR = 48_000            # native mic sample rate
+AGG_DEVICE_INDEX, CHS = _get_best_mic()
+NATIVE_SR = 48_000            # typical native mic sample rate (we will resample)
 TARGET_SR = 16_000            # Dolphin audio input rate
 TARGET_FPS = 25               # Dolphin video input rate
-MAX_RECORD_SEC = 15           # safety cap
+MAX_RECORD_SEC = 5            # target duration
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _downsample_to_mono(chunk_4ch: np.ndarray) -> np.ndarray:
-    """Average 4 channels → mono and downsample 48 kHz → 16 kHz."""
-    mono = chunk_4ch.mean(axis=1)
+def _downsample_to_mono(chunk: np.ndarray) -> np.ndarray:
+    """Ensure mono and downsample 48 kHz → 16 kHz."""
+    if len(chunk.shape) > 1 and chunk.shape[1] > 1:
+        mono = chunk.mean(axis=1)
+    else:
+        mono = chunk.reshape(-1)
     # Simple decimation: 48000 / 16000 = 3
+    # If the native sample rate is something else, this basic slicing will sound pitched.
+    # But for 48kHz (Mac default) it's ~ok.
     return mono[::3].astype(np.float32)
 
 
 class Recorder:
     """Synchronized video + audio recorder with 'i' key trigger."""
 
-    def __init__(self, output_path: str, camera_index: int = 0):
+    def __init__(self, output_path: str, camera_index: int | None = None):
         self.output_path = output_path
         self.camera_index = camera_index
 
@@ -91,7 +113,7 @@ class Recorder:
 
         print("╔══════════════════════════════════════════════════╗")
         print("║  AV-TSE Recorder                                ║")
-        print("║  Press 'i' to START / STOP recording.            ║")
+        print("║  Press 'i' to start a 5-second recording.        ║")
         print("║  Press Q or ESC to quit without saving.          ║")
         print("╚══════════════════════════════════════════════════╝")
 
@@ -118,12 +140,11 @@ class Recorder:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     cv2.circle(frame, (frame.shape[1] - 25, 25), 10, (0, 0, 255), -1)
 
-                    # Capture frame for recording
-                    if last_face_crop is not None:
-                        self._video_frames.append(last_face_crop.copy())
+                    # Capture full frame for recording (Dolphin needs full frame to track)
+                    if getattr(ts, 'current_raw_frame', None) is not None:
+                        self._video_frames.append(ts.current_raw_frame.copy())
                     else:
-                        # Fallback if no face ever detected (rare)
-                        self._video_frames.append(cv2.resize(frame, (512, 512)))
+                        self._video_frames.append(frame.copy())
 
                     # Auto-stop
                     if elapsed >= MAX_RECORD_SEC:
@@ -146,14 +167,10 @@ class Recorder:
                         record_start = time.time()
                         self._video_frames.clear()
                         self._audio_chunks.clear()
-                        print("[Recorder] ● Recording started. Press 'i' to stop.")
+                        print("\n[Recorder] ● Recording started (5 seconds)...")
                     else:
-                        # STOP recording
-                        self.recording = False
-                        ts.is_locked = False
-                        record_stop = time.time()
-                        self.done = True
-                        print("[Recorder] ■ Recording stopped.")
+                        # ALREADY recording - ignore second press
+                        print(" (recording currently in progress, please wait...) ")
 
                 elif key == ord("q") or key == 27:
                     print("[Recorder] Quit without saving.")

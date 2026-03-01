@@ -21,6 +21,7 @@ DOLPHIN_DIR = os.path.join(os.path.dirname(__file__), "..", "Dolphin")
 sys.path.insert(0, os.path.abspath(DOLPHIN_DIR))
 
 from Inference import process_video
+from ecapa_enroll import enroll_from_wav
 
 
 def main():
@@ -43,6 +44,10 @@ def main():
     parser.add_argument(
         "--face-scale", type=float, default=1.5,
         help="Face bounding box scale factor (default: 1.5)"
+    )
+    parser.add_argument(
+        "--enroll", action="store_true",
+        help="After separation, run ECAPA-TDNN on speaker WAVs and save embeddings to noise_gate/embeddings/"
     )
     args = parser.parse_args()
 
@@ -89,6 +94,28 @@ def main():
         print(f"  Speaker {i+1} audio: {wav_path}")
         print(f"  Speaker {i+1} video: {f}")
     print("=" * 60)
+
+    # ── Flow 2 integration: enroll speaker WAVs via ECAPA-TDNN ─────────
+    if args.enroll:
+        print("\n" + "=" * 60)
+        print("  ECAPA-TDNN Enrollment")
+        print("=" * 60)
+        enrolled_any = False
+        for i in range(args.speakers):
+            wav_path = os.path.join(args.output, f"speaker{i+1}_est.wav")
+            if os.path.isfile(wav_path):
+                print(f"  Enrolling speaker {i+1} from {wav_path} …")
+                try:
+                    emb_path = enroll_from_wav(wav_path)
+                    print(f"  ✓ Embedding saved → {emb_path}")
+                    enrolled_any = True
+                except Exception as exc:
+                    print(f"  ⚠  Enrollment failed for speaker {i+1}: {exc}")
+            else:
+                print(f"  ⚠  WAV not found for speaker {i+1}: {wav_path}")
+        if not enrolled_any:
+            print("  No embeddings were saved.")
+        print("=" * 60)
 
 
 if __name__ == "__main__":
