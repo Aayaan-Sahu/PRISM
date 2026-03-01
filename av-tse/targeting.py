@@ -37,6 +37,7 @@ from mediapipe.tasks.python import vision as mp_vision
 from face_lock import FaceLock, FaceSnapshot, LockState
 from recorder import AVRecorder, save_clip
 from dolphin_preprocess import preprocess_for_dolphin
+from ecapa_enroll import enroll_from_wav
 
 # ── model ──────────────────────────────────────────────────────────────────
 _MODEL_PATH = "../blaze_face_short_range.tflite"
@@ -220,7 +221,7 @@ class TargetingSystem:
             print("\n[UNLOCK] Released lock.")
 
     def _save_recording(self, clip) -> None:
-        """Save clip and run Dolphin preprocessing in background thread."""
+        """Save clip, run Dolphin preprocessing, then enroll via ECAPA-TDNN."""
         def _save():
             raw_dir = os.path.join(_RECORDINGS_DIR, "raw")
             dolphin_dir = os.path.join(_RECORDINGS_DIR, "dolphin")
@@ -228,6 +229,24 @@ class TargetingSystem:
             print(f"[SAVE] Raw clip saved to {raw_dir}")
             preprocess_for_dolphin(clip, dolphin_dir)
             print(f"[SAVE] Dolphin-ready output saved to {dolphin_dir}")
+
+            # ── Flow 2: ECAPA-TDNN enrollment ─────────────────────────────
+            # Scan dolphin_dir for speakerN_est.wav files produced by Dolphin
+            import glob
+            speaker_wavs = sorted(
+                glob.glob(os.path.join(dolphin_dir, "speaker*_est.wav"))
+            )
+            if speaker_wavs:
+                # Enroll the first (closest-to-center) speaker wav
+                wav = speaker_wavs[0]
+                print(f"[ENROLL] Running ECAPA-TDNN on {os.path.basename(wav)} …")
+                try:
+                    emb_path = enroll_from_wav(wav)
+                    print(f"[ENROLL] ✓ Embedding saved → {emb_path}")
+                except Exception as exc:
+                    print(f"[ENROLL] ⚠  ECAPA enrollment failed: {exc}")
+            else:
+                print("[ENROLL] No speaker WAVs found in dolphin output — skipping enrollment.")
 
         t = threading.Thread(target=_save, daemon=True)
         t.start()
