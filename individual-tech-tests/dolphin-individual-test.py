@@ -22,6 +22,44 @@ def _status_callback(message):
     else:
         print(f"[Status {float(progress) * 100:5.1f}%] {status}")
 
+def _is_mps_backend_error(exc):
+    message = str(exc).lower()
+    mps_markers = [
+        "mps",
+        "metal",
+        "not implemented",
+        "unsupported",
+        "invalid type: 'torch.mps",
+    ]
+    return any(marker in message for marker in mps_markers)
+
+def _run_inference(video_path, output_dir, speakers, cuda_device, requested_device, use_status):
+    if use_status and process_video_with_status is not None:
+        print("[Test] Using process_video_with_status")
+        return process_video_with_status(
+            input_file=video_path,
+            output_path=output_dir,
+            number_of_speakers=speakers,
+            detect_every_N_frame=8,
+            scalar_face_detection=1.5,
+            cuda_device=cuda_device,
+            device=requested_device,
+            status_callback=_status_callback,
+        )
+
+    if use_status and process_video_with_status is None:
+        print("[Test] Inference_with_status is unavailable; falling back to process_video")
+    print("[Test] Using process_video")
+    return process_video(
+        input_file=video_path,
+        output_path=output_dir,
+        number_of_speakers=speakers,
+        detect_every_N_frame=8,
+        scalar_face_detection=1.5,
+        cuda_device=cuda_device,
+        device=requested_device,
+    )
+
 def main():
     parser = argparse.ArgumentParser(description="Test Dolphin's ability to extract a voice from a noisy video.")
     parser.add_argument("--video", required=True, help="Path to .mp4 of a person talking with background noise")
@@ -53,32 +91,32 @@ def main():
         print(f"[Test] Requested device: {requested_device}")
         print(f"[Test] Selected device: {selected_device}")
         print(f"[Test] Speakers: {args.speakers}")
-        
-        if args.use_status and process_video_with_status is not None:
-            print("[Test] Using process_video_with_status")
-            output_files = process_video_with_status(
-                input_file=os.path.abspath(args.video),
-                output_path=output_dir,
-                number_of_speakers=args.speakers,
-                detect_every_N_frame=8,
-                scalar_face_detection=1.5,
+
+        video_path = os.path.abspath(args.video)
+        try:
+            output_files = _run_inference(
+                video_path=video_path,
+                output_dir=output_dir,
+                speakers=args.speakers,
                 cuda_device=args.cuda_device,
-                device=requested_device,
-                status_callback=_status_callback,
+                requested_device=requested_device,
+                use_status=args.use_status,
             )
-        else:
-            if args.use_status and process_video_with_status is None:
-                print("[Test] Inference_with_status is unavailable; falling back to process_video")
-            print("[Test] Using process_video")
-            output_files = process_video(
-                input_file=os.path.abspath(args.video),
-                output_path=output_dir,
-                number_of_speakers=args.speakers,
-                detect_every_N_frame=8,
-                scalar_face_detection=1.5,
-                cuda_device=args.cuda_device,
-                device=requested_device,
-            )
+        except Exception as exc:
+            if requested_device == "mps" and _is_mps_backend_error(exc):
+                print("[Test] MPS backend-op error detected. Retrying with CPU...")
+                print(f"[Test] Original MPS error: {exc}")
+                requested_device = "cpu"
+                output_files = _run_inference(
+                    video_path=video_path,
+                    output_dir=output_dir,
+                    speakers=args.speakers,
+                    cuda_device=None,
+                    requested_device="cpu",
+                    use_status=args.use_status,
+                )
+            else:
+                raise
         
         print("\n" + "="*50)
         print("✓ Test Complete!")
