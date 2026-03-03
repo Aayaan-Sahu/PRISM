@@ -33,18 +33,13 @@ import soundfile as sf
 import websockets
 from scipy.signal import resample_poly
 
-# Ensure av-tse is importable
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_AVTSE_DIR = os.path.join(_REPO_ROOT, "av-tse")
-if _AVTSE_DIR not in sys.path:
-    sys.path.insert(0, _AVTSE_DIR)
 
-from record import _get_best_mic
-from targeting import LipTargetingSystem
 
 # =====================================================================
 # Configuration
 # =====================================================================
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 MODEL_SR = 16_000
 CHUNK_DURATION = 0.15
@@ -201,6 +196,20 @@ def request_hot_reload() -> None:
 # Background Processing (Dolphin -> ECAPA)
 # =====================================================================
 
+def _run_dolphin_isolated(repo_root, mp4_in, out_dir):
+    import sys, os
+    sys.path.insert(0, os.path.join(repo_root, "Dolphin"))
+    from Inference import process_video
+    process_video(
+        input_file=mp4_in,
+        output_path=out_dir,
+        number_of_speakers=1,
+        detect_every_N_frame=8,
+        scalar_face_detection=1.5,
+        cuda_device=None,
+        skip_video_rendering=True,
+    )
+
 def _process_recording_thread(video_frames: list[np.ndarray], audio_chunks: list[np.ndarray], duration: float):
     print("\n[Processing] Starting background extraction and enrollment...")
 
@@ -228,7 +237,13 @@ def _process_recording_thread(video_frames: list[np.ndarray], audio_chunks: list
     else:
         mono_16k = raw_audio.reshape(-1)
 
-    mono_16k = mono_16k[: int(duration * MODEL_SR)].astype(np.float32)
+    target_samples = int(duration * MODEL_SR)
+    if len(mono_16k) < target_samples:
+        mono_16k = np.pad(mono_16k, (0, target_samples - len(mono_16k)))
+    else:
+        mono_16k = mono_16k[:target_samples]
+        
+    mono_16k = mono_16k.astype(np.float32)
 
     tmp_audio = os.path.join(temp_dir, "a.wav")
     sf.write(tmp_audio, mono_16k, MODEL_SR)
@@ -244,21 +259,27 @@ def _process_recording_thread(video_frames: list[np.ndarray], audio_chunks: list
     wav_to_enroll = None
 
     try:
-        sys.path.insert(0, os.path.join(_REPO_ROOT, "Dolphin"))
-        from Inference import process_video
+        import modal
 
-        print("[Processing] Running Dolphin speech separation...")
-        process_video(
-            input_file=output_mp4,
-            output_path=dolphin_out,
-            number_of_speakers=1,
-            detect_every_N_frame=8,
-            scalar_face_detection=1.5,
-            cuda_device=None,
-        )
+        print("[Processing] Sending video to Modal (H100) for Dolphin separation...")
+        with open(output_mp4, "rb") as f:
+            video_bytes = f.read()
+
+        # Connect to Modal App
+        dolphin_fn = modal.Function.from_name("dolphin-av-tse", "DolphinSeparator.separate")
+        
+        # Run separation remotely
+        results = dolphin_fn.remote(video_bytes, num_speakers=1)
+        
+        if "speaker1" not in results:
+            raise RuntimeError("Modal Dolphin ran but no speaker1_est.wav was emitted")
+
+        # Save result to the temp directory
         wav_to_enroll = os.path.join(dolphin_out, "speaker1_est.wav")
-        if not os.path.exists(wav_to_enroll):
-            raise FileNotFoundError("Dolphin ran but no speaker1_est.wav was emitted")
+        os.makedirs(dolphin_out, exist_ok=True)
+        with open(wav_to_enroll, "wb") as f:
+            f.write(results["speaker1"])
+            
     except Exception as exc:
         print(f"[Processing] Dolphin unavailable/failing ({exc}); using raw audio")
         wav_to_enroll = tmp_audio
@@ -288,6 +309,14 @@ def _process_recording_thread(video_frames: list[np.ndarray], audio_chunks: list
 
 def run_camera_ui(camera_index: int | None = None):
     global is_recording, record_start_time, recorded_frames, recorded_audio_chunks
+
+    # Import inside function to prevent multiprocessing spawn thread from
+    # initializing mediapipe/tensorflow and breaking RetinaFace logic.
+    _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+    _AVTSE_DIR = os.path.join(_REPO_ROOT, "av-tse")
+    if _AVTSE_DIR not in sys.path:
+        sys.path.insert(0, _AVTSE_DIR)
+    from targeting import LipTargetingSystem
 
     print(f"\n[UI] Opening targeting camera (index={camera_index if camera_index is not None else 'auto'})...")
     with LipTargetingSystem(camera_index=camera_index) as ts:
@@ -364,6 +393,13 @@ def run_camera_ui(camera_index: int | None = None):
 
 async def stream_audio_task(ws_url: str):
     global is_recording, recorded_audio_chunks
+
+    # Import inside function to prevent multiprocessing spawn thread issues
+    _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+    _AVTSE_DIR = os.path.join(_REPO_ROOT, "av-tse")
+    if _AVTSE_DIR not in sys.path:
+        sys.path.insert(0, _AVTSE_DIR)
+    from record import _get_best_mic
 
     idx, chs = _get_best_mic()
     print(f"[Audio] Starting mic stream (input dev={idx}, output dev=default)")

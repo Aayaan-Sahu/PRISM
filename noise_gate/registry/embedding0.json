@@ -1,0 +1,7 @@
+{
+  "created_at": 1772361953.4086149,
+  "embedding_path": "/Users/aayaansahu/Dev/SPATIAL-AUDIO-RECOGNITION/noise_gate/embeddings/embedding0.npy",
+  "reference_path": "/Users/aayaansahu/Dev/SPATIAL-AUDIO-RECOGNITION/noise_gate/references/embedding0.wav",
+  "source": "bootstrap",
+  "speaker_id": "embedding0"
+}

@@ -63,7 +63,7 @@ app = modal.App("dolphin-av-tse", image=dolphin_image)
 # ─── GPU-Accelerated Separator ───────────────────────────────────────────
 
 @app.cls(
-    gpu="A10G",                      # Cheapest GPU that handles Dolphin well
+    gpu="H100",                      # Fastest Modal GPU for heavy loads
     timeout=180,                     # 3 min max per call (safety net)
     scaledown_window=60,             # Release GPU after 60s of inactivity
 )

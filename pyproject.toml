@@ -33,4 +33,5 @@ dependencies = [
     "vector-quantize-pytorch>=1.27.21",
     "fastapi",
     "websockets",
+    "silero-vad>=6.2.1",
 ]
