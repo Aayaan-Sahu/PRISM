@@ -6,4 +6,4 @@ old/
 
 .DS_Store
 
-Dolphin/__pycache__/
+Dolphin/**/__pycache__/
