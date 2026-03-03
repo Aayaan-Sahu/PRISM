@@ -1,0 +1,9 @@
+individual-tech-tests/__pycache__/
+individual-tech-tests/data/
+individual-tech-tests/output/
+
+old/
+
+.DS_Store
+
+Dolphin/__pycache__/
