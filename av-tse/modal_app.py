@@ -101,7 +101,7 @@ class DolphinSeparator:
 
     @modal.method()
     def separate(self, video_bytes: bytes, num_speakers: int = 1) -> dict:
-        """
+        """temp_audio
         Receives a raw .mp4 as bytes, runs the full Dolphin pipeline,
         and returns a dict mapping speaker names to their isolated .wav bytes.
 

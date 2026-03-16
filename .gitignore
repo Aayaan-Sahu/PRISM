@@ -7,3 +7,5 @@ old/
 .DS_Store
 
 Dolphin/**/__pycache__/
+
+__pycache__/**
