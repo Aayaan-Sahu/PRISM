@@ -41,8 +41,8 @@ def main():
     with LipTargetingSystem(camera_index=0) as targeting_system:
         av_recorder = Recorder(targeting_system=targeting_system, on_record_complete=queue_dolphin_inference)
 
-        for angle, lip_crop, face_crop in targeting_system.stream(display=True):
-            av_recorder.process_frame(angle, face_crop)
+        for annotated_frame, angle, raw_frame, bounding_box in targeting_system.stream(display=True):
+            av_recorder.process_frame(raw_frame, bounding_box)
 
         av_recorder.close()
     

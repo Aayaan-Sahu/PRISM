@@ -19,9 +19,12 @@ class Recorder:
         self.output_prefix = output_prefix
         self.on_record_complete = on_record_complete
 
-        self.recorded_faces = []
+        # Stores tuple: (timestamp, frame, bounding_box)
+        self.recorded_frames = []
         self.recorded_audio_chunks = []
-        self.last_valid_face = np.zeros((512, 512, 3), dtype=np.uint8)
+        
+        # Will dynamically learn the raw frame shape
+        self.last_valid_frame = None
 
         self.was_recording = False
         self.recording_start_time = None
@@ -96,27 +99,27 @@ class Recorder:
             self.shutdown_requested.wait()
         print("[AUDIO] Mic stream closed.")
 
-    def _merge_video_task(self, face_frames, audio_chunks, run_id):
-        if not face_frames or not audio_chunks:
+    def _merge_video_task(self, video_frames, audio_chunks, run_id):
+        if not video_frames or not audio_chunks:
             return
 
-        start_ts = max(face_frames[0][0], audio_chunks[0][0])
-        end_ts = min(face_frames[-1][0], audio_chunks[-1][0])
+        start_ts = max(video_frames[0][0], audio_chunks[0][0])
+        end_ts = min(video_frames[-1][0], audio_chunks[-1][0])
 
         if end_ts <= start_ts:
             return
 
         # Keep only the valid frames that are within the correct timestamps
-        face_frames = [
-            (ts, frame) for ts, frame in face_frames if start_ts <= ts <= end_ts
+        video_frames = [
+            (ts, frame, bbox) for ts, frame, bbox in video_frames if start_ts <= ts <= end_ts
         ]
         audio_chunks = [(ts, chunk) for ts, chunk in audio_chunks if ts <= end_ts]
 
-        if not face_frames or not audio_chunks:
+        if not video_frames or not audio_chunks:
             return
 
         print(
-            f"[BACKGROUND] Saving {len(face_frames)} frames to {self.output_prefix}.mp4"
+            f"[BACKGROUND] Saving {len(video_frames)} frames to {self.output_prefix}.mp4"
         )
 
         unique_prefix = f"{self.output_prefix}_{run_id}"
@@ -124,6 +127,7 @@ class Recorder:
         temp_audio = f"temp_audio_{unique_prefix}.wav"
         temp_model_audio = f"temp_model_audio_{unique_prefix}.wav"
         final_output = f"{unique_prefix}.mp4"
+        json_output = f"target_tracking.json" # Always save tracking as generic target JSON
 
         # Process the audio data
         aligned_audio_parts = []
@@ -161,18 +165,30 @@ class Recorder:
 
         fps = 30.0
         output_frame_count = max(1, int(round(duration * fps)))
-        frame_times = np.array([ts for ts, _ in face_frames], dtype=np.float64)
-        frames_only = [frame for _, frame in face_frames]
+        frame_times = np.array([ts for ts, _, _ in video_frames], dtype=np.float64)
+        frames_only = [frame for _, frame, _ in video_frames]
+        bboxes_only = [bbox for _, _, bbox in video_frames]
 
+        h, w = frames_only[0].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(temp_video, fourcc, fps, (512, 512))
+        out = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
+
+        tracking_data = {}
 
         for i in range(output_frame_count):
             target_ts = start_ts + (i / fps)
             idx = np.searchsorted(frame_times, target_ts, side="right") - 1
             idx = max(0, min(idx, len(frames_only) - 1))
+            
             out.write(frames_only[idx])
+            tracking_data[str(i)] = bboxes_only[idx]
+            
         out.release()
+        
+        import json
+        with open(json_output, "w") as f:
+            json.dump(tracking_data, f)
+        print(f"[BACKGROUND] Saved tracking coordinates to {json_output}")
 
         # Merge audio and video data to the self.output_prefix location
         print("[PROCESSING] Merging tracks...")
@@ -196,11 +212,11 @@ class Recorder:
         if self.on_record_complete:
             self.on_record_complete(final_output)
 
-    def process_frame(self, angle, face_crop):
+    def process_frame(self, raw_frame, bounding_box):
         now = time.perf_counter()
 
-        if face_crop is not None:
-            self.last_valid_face = face_crop.copy()
+        if raw_frame is not None:
+            self.last_valid_frame = raw_frame.copy()
 
         # Just started recording
         if not self.was_recording and self.targeting_system.is_recording:
@@ -212,37 +228,29 @@ class Recorder:
             self.recording_stop_time = now
 
             with self.buffer_lock:
-                faces_copy = self.recorded_faces.copy()
+                frames_copy = self.recorded_frames.copy()
                 audio_copy = self.recorded_audio_chunks.copy()
-                self.recorded_faces.clear()
+                self.recorded_frames.clear()
                 self.recorded_audio_chunks.clear()
 
             # merge the video on another thread
             run_id = int(time.time())
             save_thread = threading.Thread(
-                target=self._merge_video_task, args=(faces_copy, audio_copy, run_id)
+                target=self._merge_video_task, args=(frames_copy, audio_copy, run_id)
             )
             save_thread.start()
 
-        # if mediapipe drops then save the last known frame, otherwise save current frame
+        # if tracking drops then save the last known frame, otherwise save current frame
         if self.targeting_system.is_recording:
             frame_to_append = (
-                face_crop.copy()
-                if face_crop is not None
-                else self.last_valid_face.copy()
+                raw_frame.copy()
+                if raw_frame is not None
+                else self.last_valid_frame.copy() if self.last_valid_frame is not None else np.zeros((720, 1280, 3), dtype=np.uint8)
             )
             with self.buffer_lock:
-                self.recorded_faces.append((now, frame_to_append))
+                self.recorded_frames.append((now, frame_to_append, bounding_box))
 
         self.was_recording = self.targeting_system.is_recording
-
-        if angle is not None and face_crop is not None:
-            sign = "+" if angle >= 0 else ""
-            print(
-                f"\r[NETWORK FEED] Locked at {sign}{angle:05.1f}° | Sending {face_crop.shape} to neural net...",
-                end="",
-                flush=True,
-            )
 
     def close(self):
         self.shutdown_requested.set()

@@ -120,10 +120,10 @@ class LipTargetingSystem:
         cv2.destroyAllWindows()
 
     @property
-    def current_target_data(self) -> Tuple[float | None, np.ndarray | None, np.ndarray | None]:
-        # Returns the current lip targeting data as a tuple of (angle, lip_crop, face_crop)
+    def current_target_data(self) -> Tuple[np.ndarray | None, float | None, np.ndarray | None, list | None]:
+        # Returns the current targeting data as a tuple of (annotated_frame, angle, raw_frame, bounding_box)
         with self._lock:
-            return self._current_angle, self._current_lip_crop, self._current_face_crop
+            return self._current_frame, self._current_angle, self._current_raw_frame, self._current_bounding_box
 
     @property
     def current_raw_frame(self) -> np.ndarray | None:
@@ -131,11 +131,10 @@ class LipTargetingSystem:
         with self._lock:
             return self._current_raw_frame
 
-    def stream(self, display: bool = True) -> Generator[Tuple[float | None, np.ndarray | None, np.ndarray | None], None, None]:
+    def stream(self, display: bool = True) -> Generator[Tuple[np.ndarray | None, float | None, np.ndarray | None, list | None], None, None]:
         # A generator that yields the current targeting data whenever a new frame is processed. This can be used to drive the rest of the system.
         for _ in self._run_capture_loop(display=display):
             yield self.current_target_data
-
 
     def _run_capture_loop(self, display: bool = True) -> Iterator[None]:
         assert self._capture is not None and self._detector is not None
@@ -146,20 +145,18 @@ class LipTargetingSystem:
             if not ok:
                 break
 
-            angle, lip_crop, face_crop = self._process_frame(frame, draw=display)
+            angle, bounding_box, raw_frame = self._process_frame(frame, draw=display)
 
             # thread-safely update the current targeting data
             with self._lock:
                 self._current_angle = angle
-                self._current_lip_crop = lip_crop
-                self._current_face_crop = face_crop
-                self._current_raw_frame = frame.copy()
+                self._current_bounding_box = bounding_box
+                self._current_raw_frame = raw_frame
+                self._current_frame = frame.copy()
             
             # Display the frame if requested
             if display:
                 cv2.imshow("Face Tracker", frame)
-                if face_crop is not None:
-                    cv2.imshow("Extracted Face to network", face_crop)
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
@@ -182,61 +179,10 @@ class LipTargetingSystem:
             # hand control back to caller to do other work if needed
             yield
 
-    def _align_face(self, frame, landmarks, target_size=(512, 512)) -> np.ndarray:
-        h, w = frame.shape[:2]
-        # Get coordinates for eyes and nose
-        # Indices in FaceMesh: Left Outer Eye: 33, Right Outer Eye: 263, Nose: 1
-        l_eye = np.array([landmarks[33].x * w, landmarks[33].y * h])
-        r_eye = np.array([landmarks[263].x * w, landmarks[263].y * h])
-        nose = np.array([landmarks[1].x * w, landmarks[1].y * h])
-
-        # Smooth landmarks using EMA
-        if self._ema_landmarks is None:
-            self._ema_landmarks = landmarks
-        else:
-            # We only smooth the specific points used for alignment to keep it simple but effective
-            pass 
-
-        # Calculate angle for rotation
-        dy = r_eye[1] - l_eye[1]
-        dx = r_eye[0] - l_eye[0]
-        angle_rad = np.arctan2(dy, dx)
-        angle_deg = np.degrees(angle_rad)
-
-        # Distance between eyes
-        eye_dist = np.sqrt(dx**2 + dy**2)
+    def _process_frame(self, frame, draw: bool = True) -> Tuple[float | None, list | None, np.ndarray | None]:
+        # Save a clean, untouched copy of the frame for the neural network
+        clean_frame = frame.copy()
         
-        # We want the face to occupy a specific resolution and be centered
-        # Zoomed out: eyes should be ~22% of the way down, and dist should be ~22% of width
-        desired_eye_dist = target_size[0] * 0.22
-        raw_scale = desired_eye_dist / eye_dist
-
-        # Smooth scale and angle to prevent zooming in when turning head (yaw)
-        if self._ema_scale is None:
-            self._ema_scale = raw_scale
-            self._ema_angle = angle_deg
-        else:
-            self._ema_scale = self._alpha_slow * raw_scale + (1 - self._alpha_slow) * self._ema_scale
-            self._ema_angle = self._alpha_slow * angle_deg + (1 - self._alpha_slow) * self._ema_angle
-
-        # Center of rotation (between eyes)
-        center = (l_eye + r_eye) / 2
-        
-        # Transformation matrix using smoothed values
-        M = cv2.getRotationMatrix2D(tuple(center), self._ema_angle, self._ema_scale)
-
-        # Shift to center the face in the target image
-        # Zoomed out values: Center (0.5, 0.45)
-        tx = target_size[0] * 0.5 - center[0]
-        ty = target_size[1] * 0.45 - center[1]
-        
-        M[0, 2] += tx
-        M[1, 2] += ty
-
-        aligned = cv2.warpAffine(frame, M, target_size, flags=cv2.INTER_LANCZOS4)
-        return aligned
-
-    def _process_frame(self, frame, draw: bool = True) -> Tuple[float | None, np.ndarray | None, np.ndarray | None]:
         h, w = frame.shape[:2]
         cx, cy = w // 2, h // 2
 
@@ -281,14 +227,31 @@ class LipTargetingSystem:
                 self._ema_landmarks[i][1] = self._alpha * target_face[i].y + (1 - self._alpha) * self._ema_landmarks[i][1]
                 self._ema_landmarks[i][2] = self._alpha * target_face[i].z + (1 - self._alpha) * self._ema_landmarks[i][2]
 
-        # Use smoothed landmarks for everything
         smoothed_face = [type('obj', (object,), {'x': l[0], 'y': l[1], 'z': l[2]}) for l in self._ema_landmarks]
         
         nose_x = smoothed_face[1].x
         target_angle = _angle_from_nose_x(nose_x)
         
-        # Generate stable face crop
-        face_crop = self._align_face(frame, smoothed_face)
+        # Calculate Bounding Box instead of aligning/cropping
+        x_coords = [lm.x * w for lm in smoothed_face]
+        y_coords = [lm.y * h for lm in smoothed_face]
+            
+        xmin, xmax = min(x_coords), max(x_coords)
+        ymin, ymax = min(y_coords), max(y_coords)
+        
+        # Expand the bounding box by ~1.2x to cover the entire head (RetinaFace style)
+        box_w = xmax - xmin
+        box_h = ymax - ymin
+        
+        pad_w = box_w * 0.1
+        pad_h = box_h * 0.1
+        
+        bbox_xmin = int(max(0, xmin - pad_w))
+        bbox_ymin = int(max(0, ymin - pad_h))
+        bbox_xmax = int(min(w, xmax + pad_w))
+        bbox_ymax = int(min(h, ymax + pad_h))
+        
+        bounding_box = [bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax]
 
         if draw:
             # Draw standard landmarks on the original frame
@@ -304,5 +267,7 @@ class LipTargetingSystem:
                 label = f"LOCKED: {sign}{target_angle:.1f}°"
                 # Draw label top left
                 cv2.putText(frame, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TARGET, 2, cv2.LINE_AA)
+                cv2.rectangle(frame, (bbox_xmin, bbox_ymin), (bbox_xmax, bbox_ymax), COLOR_TARGET, 2)
 
-        return target_angle, None, face_crop
+        # Return full raw frame (not modified by drawing) instead of face crop
+        return target_angle, bounding_box, clean_frame

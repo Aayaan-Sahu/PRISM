@@ -22,7 +22,7 @@ from Inference import (
     resolve_device, MEAN_FACE_LANDMARKS_PATH
 )
 
-def detectface_with_status(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, status_callback=None, device=None):
+def detectface_with_status(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, status_callback=None, device=None, target_boxes=None):
     """Face detection with status updates"""
     if device is None:
         device = torch.device("cpu")
@@ -62,28 +62,39 @@ def detectface_with_status(video_input_path, output_path, detect_every_N_frame, 
         if i % detect_every_N_frame == 0:
             frame_array = np.array(frame)
 
-            detected_boxes, _ = detect_faces(
-                frame_array,
-                threshold=0.9,
-                allow_upscaling=False,
-            )
-
-            if detected_boxes is None or len(detected_boxes) == 0:
+            # --- TARGET TRACKING OVERRIDE ---
+            if target_boxes is not None and str(i) in target_boxes and target_boxes[str(i)] is not None:
+                # Bypass RetinaFace entirely, use the explicitly targeted box from JSON
+                box_coords = target_boxes[str(i)]
+                # Ensure the box is scaled out slightly for Lip landmarks context if not already
+                detected_boxes = [box_coords]
+                if status_callback and i == 0:
+                    status_callback({'status': f'Target Override Active: using predefined box for speaker 1', 'progress': 0.1})
+            else:
+                # --- ORIGINAL RETINAFACE LOGIC ---
                 detected_boxes, _ = detect_faces(
                     frame_array,
-                    threshold=0.7,
-                    allow_upscaling=True,
+                    threshold=0.9,
+                    allow_upscaling=False,
                 )
 
-            if detected_boxes is not None and len(detected_boxes) > 0:
-                detected_boxes = np.asarray(detected_boxes, dtype=np.float32)
-                areas = (detected_boxes[:, 2] - detected_boxes[:, 0]) * (detected_boxes[:, 3] - detected_boxes[:, 1])
-                sort_idx = np.argsort(areas)[::-1]
-                detected_boxes = detected_boxes[sort_idx][:number_of_speakers]
-                detected_boxes = face2head(detected_boxes, scalar_face_detection)
-                detected_boxes = [box for box in detected_boxes]
-            else:
-                detected_boxes = []
+                if detected_boxes is None or len(detected_boxes) == 0:
+                    detected_boxes, _ = detect_faces(
+                        frame_array,
+                        threshold=0.7,
+                        allow_upscaling=True,
+                    )
+
+                if detected_boxes is not None and len(detected_boxes) > 0:
+                    detected_boxes = np.asarray(detected_boxes, dtype=np.float32)
+                    areas = (detected_boxes[:, 2] - detected_boxes[:, 0]) * (detected_boxes[:, 3] - detected_boxes[:, 1])
+                    sort_idx = np.argsort(areas)[::-1]
+                    detected_boxes = detected_boxes[sort_idx][:number_of_speakers]
+                    # Expanding bounding box scale is only appropriate for standard RetinaFace outputs
+                    detected_boxes = face2head(detected_boxes, scalar_face_detection)
+                    detected_boxes = [box for box in detected_boxes]
+                else:
+                    detected_boxes = []
 
         # Process the detection results (same as original)
         if i == 0:
@@ -268,7 +279,7 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
                              detect_every_N_frame=8, scalar_face_detection=1.5,
                              config_path="checkpoints/vox2/conf.yml",
                              cuda_device=None, status_callback=None,
-                             device="auto"):
+                             device="auto", target_boxes=None):
     """Main processing function with status updates"""
 
     run_device = resolve_device(device, cuda_device)
@@ -296,7 +307,8 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
         scalar_face_detection=scalar_face_detection, 
         number_of_speakers=number_of_speakers,
         status_callback=status_callback,
-        device=run_device
+        device=run_device,
+        target_boxes=target_boxes,
     )
     if run_device.type == "cuda":
         torch.cuda.empty_cache()

@@ -52,9 +52,10 @@ class DolphinSeparator:
         sys.path.insert(0, "/app/Dolphin")
 
     @modal.method()
-    def separate(self, video_bytes: bytes, num_speakers: int = 1) -> dict:
+    def separate(self, video_bytes: bytes, num_speakers: int = 1, tracking_json_bytes: bytes = None) -> dict:
         import uuid
         import shutil
+        import json
         from Inference_with_status import process_video_with_status
 
         # Create a temporary working directory
@@ -64,6 +65,11 @@ class DolphinSeparator:
         input_video_path = os.path.join(work_dir, "input.mp4")
         with open(input_video_path, "wb") as f:
             f.write(video_bytes)
+            
+        target_boxes = None
+        if tracking_json_bytes is not None:
+            target_boxes = json.loads(tracking_json_bytes)
+            print(f"[Modal] Received targeted tracking JSON with {len(target_boxes)} frames.")
         
         output_dir = os.path.join(work_dir, "output")
         os.makedirs(output_dir, exist_ok=True)
@@ -87,29 +93,32 @@ class DolphinSeparator:
             scalar_face_detection=1.5,
             cuda_device=0,
             device="cuda",
-            status_callback=status_logger
+            status_callback=status_logger,
+            target_boxes=target_boxes,
         )
         
         print("[Modal] Collecting output files...")
         results = {}
-        # Collect generated audio and video files
-        for i in range(1, num_speakers + 1):
-            wav_path = os.path.join(output_dir, f"speaker{i}_est.wav")
-            mp4_path = os.path.join(output_dir, f"s{i}.mp4")
-            
-            if os.path.exists(wav_path):
-                with open(wav_path, "rb") as f:
-                    results[f"speaker{i}_est.wav"] = f.read()
-            
-            if os.path.exists(mp4_path):
-                with open(mp4_path, "rb") as f:
-                    results[f"s{i}.mp4"] = f.read()
-        
-        # Cleanup temporary files
+        for file_path in output_files:
+            if os.path.exists(file_path):
+                filename = os.path.basename(file_path)
+                with open(file_path, "rb") as f:
+                    results[filename] = f.read()
+
+        # Grab the isolated audio as well
+        audio_paths = [os.path.join(output_dir, f"speaker{i+1}_est.wav") for i in range(num_speakers)]
+        for audio_path in audio_paths:
+            if os.path.exists(audio_path):
+                filename = os.path.basename(audio_path)
+                with open(audio_path, "rb") as f:
+                    results[filename] = f.read()
+
+        print(f"[Modal] Returning {len(results)} files.")
+        # Cleanup
         shutil.rmtree(work_dir, ignore_errors=True)
         return results
 
-def main(video_path: str = "output_faces.mp4", num_speakers: int = 1, output_dir: str = "modal_output"):
+def main(video_path: str = "output_faces.mp4", num_speakers: int = 1, output_dir: str = "modal_output", tracking_path: str = "target_tracking.json"):
     if not os.path.exists(video_path):
         print(f"Error: Could not find input video '{video_path}'")
         return
@@ -120,11 +129,17 @@ def main(video_path: str = "output_faces.mp4", num_speakers: int = 1, output_dir
     print(f"Reading {video_path}...")
     with open(video_path, "rb") as f:
         video_bytes = f.read()
+        
+    tracking_json_bytes = None
+    if os.path.exists(tracking_path):
+        print(f"Reading target tracking data {tracking_path}...")
+        with open(tracking_path, "rb") as f:
+            tracking_json_bytes = f.read()
 
     print(f"Sending video to Modal for inference (Job: {base_name})...")
     with app.run():
         separator = DolphinSeparator()
-        results = separator.separate.remote(video_bytes, num_speakers)
+        results = separator.separate.remote(video_bytes, num_speakers, tracking_json_bytes)
 
     if results:
         os.makedirs(job_output_dir, exist_ok=True)
