@@ -18,14 +18,12 @@ from face_detection_utils import detect_faces
 from Inference import (
     linear_interpolate, warp_img, apply_transform, cut_patch, convert_bgr2gray,
     save2npz, read_video, face2head, bb_intersection_over_union, 
-    landmarks_interpolate, crop_patch, convert_video_fps, extract_audio, merge_video_audio,
-    resolve_device, MEAN_FACE_LANDMARKS_PATH
+    landmarks_interpolate, crop_patch, convert_video_fps, extract_audio, merge_video_audio
 )
 
-def detectface_with_status(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, status_callback=None, device=None, target_boxes=None):
+def detectface_with_status(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, status_callback=None):
     """Face detection with status updates"""
-    if device is None:
-        device = torch.device("cpu")
+    device = torch.device('cuda' if torch.cuda.get_device_name() else 'cpu')
     if status_callback:
         status_callback({'status': f'Running on device: {device}', 'progress': 0.0})
     
@@ -51,8 +49,7 @@ def detectface_with_status(video_input_path, output_path, detect_every_N_frame, 
         status_callback({'status': f'Processing {total_frames} frames', 'progress': 0.1})
     
     video_clip.close()
-    fa_device = "cuda" if torch.device(device).type == "cuda" else "cpu"
-    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False, device=fa_device)
+    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
     
     for i, frame in enumerate(frames):
         if status_callback and i % 10 == 0:
@@ -62,39 +59,28 @@ def detectface_with_status(video_input_path, output_path, detect_every_N_frame, 
         if i % detect_every_N_frame == 0:
             frame_array = np.array(frame)
 
-            # --- TARGET TRACKING OVERRIDE ---
-            if target_boxes is not None and str(i) in target_boxes and target_boxes[str(i)] is not None:
-                # Bypass RetinaFace entirely, use the explicitly targeted box from JSON
-                box_coords = target_boxes[str(i)]
-                # Ensure the box is scaled out slightly for Lip landmarks context if not already
-                detected_boxes = [box_coords]
-                if status_callback and i == 0:
-                    status_callback({'status': f'Target Override Active: using predefined box for speaker 1', 'progress': 0.1})
-            else:
-                # --- ORIGINAL RETINAFACE LOGIC ---
+            detected_boxes, _ = detect_faces(
+                frame_array,
+                threshold=0.9,
+                allow_upscaling=False,
+            )
+
+            if detected_boxes is None or len(detected_boxes) == 0:
                 detected_boxes, _ = detect_faces(
                     frame_array,
-                    threshold=0.9,
-                    allow_upscaling=False,
+                    threshold=0.7,
+                    allow_upscaling=True,
                 )
 
-                if detected_boxes is None or len(detected_boxes) == 0:
-                    detected_boxes, _ = detect_faces(
-                        frame_array,
-                        threshold=0.7,
-                        allow_upscaling=True,
-                    )
-
-                if detected_boxes is not None and len(detected_boxes) > 0:
-                    detected_boxes = np.asarray(detected_boxes, dtype=np.float32)
-                    areas = (detected_boxes[:, 2] - detected_boxes[:, 0]) * (detected_boxes[:, 3] - detected_boxes[:, 1])
-                    sort_idx = np.argsort(areas)[::-1]
-                    detected_boxes = detected_boxes[sort_idx][:number_of_speakers]
-                    # Expanding bounding box scale is only appropriate for standard RetinaFace outputs
-                    detected_boxes = face2head(detected_boxes, scalar_face_detection)
-                    detected_boxes = [box for box in detected_boxes]
-                else:
-                    detected_boxes = []
+            if detected_boxes is not None and len(detected_boxes) > 0:
+                detected_boxes = np.asarray(detected_boxes, dtype=np.float32)
+                areas = (detected_boxes[:, 2] - detected_boxes[:, 0]) * (detected_boxes[:, 3] - detected_boxes[:, 1])
+                sort_idx = np.argsort(areas)[::-1]
+                detected_boxes = detected_boxes[sort_idx][:number_of_speakers]
+                detected_boxes = face2head(detected_boxes, scalar_face_detection)
+                detected_boxes = [box for box in detected_boxes]
+            else:
+                detected_boxes = []
 
         # Process the detection results (same as original)
         if i == 0:
@@ -108,9 +94,8 @@ def detectface_with_status(video_input_path, output_path, detect_every_N_frame, 
                 face = frame.crop((box[0], box[1], box[2], box[3])).resize((224,224))
                 preds = fa.get_landmarks(np.array(face))
                 
-                if preds is None or len(preds) == 0:
+                if preds is None:
                     raise ValueError(f"Face landmarks not detected in initial frame for speaker {j}")
-                preds = [preds[0]]
                 
                 faces_dic[j].append(face)
                 landmarks_dic[j].append(preds)
@@ -149,11 +134,9 @@ def detectface_with_status(video_input_path, output_path, detect_every_N_frame, 
                 face = frame.crop((box[0], box[1], box[2], box[3])).resize((224,224))
                 preds = fa.get_landmarks(np.array(face))
                 
-                if preds is None or len(preds) == 0:
+                if preds is None:
                     # Use previous landmarks if detection fails
                     preds = landmarks_dic[speaker_id][-1]
-                else:
-                    preds = [preds[0]]
                 
                 faces_dic[speaker_id].append(face)
                 landmarks_dic[speaker_id].append(preds)
@@ -266,7 +249,7 @@ def crop_mouth_with_status(video_direc, landmark_direc, filename_path, save_dire
             continue
 
         # Crop
-        mean_face_landmarks = np.load(MEAN_FACE_LANDMARKS_PATH)
+        mean_face_landmarks = np.load('assets/20words_mean_face.npy')
         sequence = crop_patch(mean_face_landmarks, video_pathname, preprocessed_landmarks, 12, 48, 68, 96, 96)
         assert sequence is not None, "cannot crop from {}.".format(filename)
 
@@ -278,13 +261,18 @@ def crop_mouth_with_status(video_direc, landmark_direc, filename_path, save_dire
 def process_video_with_status(input_file, output_path, number_of_speakers=2, 
                              detect_every_N_frame=8, scalar_face_detection=1.5,
                              config_path="checkpoints/vox2/conf.yml",
-                             cuda_device=None, status_callback=None,
-                             device="auto", target_boxes=None):
+                             cuda_device=None, status_callback=None):
     """Main processing function with status updates"""
-
-    run_device = resolve_device(device, cuda_device)
-    if status_callback:
-        status_callback({'status': f'Using compute device: {run_device}', 'progress': 0.0})
+    
+    # Set CUDA device if specified
+    # if cuda_device is not None:
+    #     os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
+    if cuda_device is not None and torch.cuda.is_available():
+        device = torch.device(f"cuda:{cuda_device}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"Using device: {device}")
     
     # Create output directory
     os.makedirs(output_path, exist_ok=True)
@@ -295,6 +283,7 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
     
     temp_25fps_file = os.path.join(output_path, 'temp_25fps.mp4')
     convert_video_fps(input_file, temp_25fps_file, target_fps=25)
+    print(f"Converted video ({input_file}) to 25 fps.")
     
     # Detect faces
     if status_callback:
@@ -306,18 +295,17 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
         detect_every_N_frame=detect_every_N_frame, 
         scalar_face_detection=scalar_face_detection, 
         number_of_speakers=number_of_speakers,
-        status_callback=status_callback,
-        device=run_device,
-        target_boxes=target_boxes,
+        status_callback=status_callback
     )
-    if run_device.type == "cuda":
-        torch.cuda.empty_cache()
+    print("Detected face")
+    torch.cuda.empty_cache()
     # Extract audio
     if status_callback:
         status_callback({'status': 'Extracting audio from video', 'progress': 0.5})
     
     audio_output = os.path.join(output_path, 'audio.wav')
     extract_audio(temp_25fps_file, audio_output, sample_rate=16000)
+    print("Extracted audio")
     
     # Crop mouth
     if status_callback:
@@ -336,10 +324,10 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
     # Load model
     if status_callback:
         status_callback({'status': 'Loading Dolphin model', 'progress': 0.6})
-    if run_device.type == "cuda":
-        torch.cuda.empty_cache()
-    audiomodel = Dolphin.from_pretrained("JusperLee/Dolphin")
-    audiomodel.to(run_device)
+    torch.cuda.empty_cache()
+    # audiomodel = Dolphin.from_pretrained("JusperLee/Dolphin")
+    audiomodel = Dolphin.from_pretrained("JusperLee/Dolphin").to(device)
+    # audiomodel.cuda()
     audiomodel.eval()
     
     # Process each speaker
@@ -353,7 +341,7 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
             mouth_roi = get_preprocessing_pipelines()["val"](mouth_roi)
             
             mix, sr = torchaudio.load(audio_output)
-            mix = mix.mean(dim=0).to(run_device)
+            mix = mix.mean(dim=0)
             
             window_size = 4 * sr 
             hop_size = int(4 * sr)
@@ -371,10 +359,12 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
                 end_frame = int(end_idx / sr * 25)
                 end_frame = min(end_frame, len(mouth_roi))
                 window_mouth_roi = mouth_roi[start_frame:end_frame]
-                mouth_tensor = torch.from_numpy(window_mouth_roi[None, None]).float().to(run_device)
                 
-                est_sources = audiomodel(window_mix[None], 
-                                    mouth_tensor)
+                window_mix_tensor = window_mix[None].to(device)
+                window_mouth_tensor = torch.from_numpy(window_mouth_roi[None, None]).float().to(device)
+                est_sources = audiomodel(window_mix_tensor, window_mouth_tensor)
+                # est_sources = audiomodel(window_mix[None], 
+                #                     torch.from_numpy(window_mouth_roi[None, None]).float())
                 
                 all_estimates.append({
                     'start': start_idx,
@@ -391,8 +381,7 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
                 
                 if start_idx >= len(mix):
                     break
-                if run_device.type == "cuda":
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
             
             output_length = len(mix)
             merged_output = torch.zeros(1, output_length)
@@ -411,8 +400,7 @@ def process_video_with_status(input_file, output_path, number_of_speakers=2,
             torchaudio.save(audio_save_path, merged_output, sr)
 
     # Merge video with separated audio for each speaker
-    if run_device.type == "cuda":
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     if status_callback:
         status_callback({'status': 'Merging videos with separated audio', 'progress': 0.9})
     

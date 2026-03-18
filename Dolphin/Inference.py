@@ -18,39 +18,6 @@ from look2hear.datas.transform import get_preprocessing_pipelines
 
 from face_detection_utils import detect_faces
 
-DOLPHIN_ROOT = os.path.dirname(os.path.abspath(__file__))
-MEAN_FACE_LANDMARKS_PATH = os.path.join(DOLPHIN_ROOT, "assets", "20words_mean_face.npy")
-
-def _is_mps_available() -> bool:
-    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-
-def resolve_device(requested_device="auto", cuda_device=None) -> torch.device:
-    requested = (requested_device or "auto").lower()
-    if requested not in {"auto", "cpu", "cuda", "mps"}:
-        raise ValueError(f"Unsupported device '{requested_device}'. Use one of: auto, cpu, mps, cuda.")
-
-    if requested in {"auto", "cuda"} and cuda_device is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-
-    if requested == "cpu":
-        return torch.device("cpu")
-
-    if requested == "mps":
-        if not _is_mps_available():
-            raise RuntimeError("MPS was requested but is not available on this machine.")
-        return torch.device("mps")
-
-    if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available in this PyTorch build/runtime.")
-        return torch.device("cuda")
-
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if _is_mps_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
 # -- Landmark interpolation:
 def linear_interpolate(landmarks, start_idx, stop_idx):
     start_landmarks = landmarks[start_idx]
@@ -156,9 +123,8 @@ def bb_intersection_over_union(boxA, boxB):
     # return the intersection over union value
     return iou
 
-def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, device=None):
-    if device is None:
-        device = torch.device("cpu")
+def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers):
+    device = torch.device('cuda' if torch.cuda.get_device_name() else 'cpu')
     print('Running on device: {}'.format(device))
     os.makedirs(os.path.join(output_path, 'faces'), exist_ok=True)
     os.makedirs(os.path.join(output_path, 'landmark'), exist_ok=True)
@@ -177,8 +143,7 @@ def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_
     frames = [Image.fromarray(frame) for frame in video_clip.iter_frames()]
     print('Number of frames in video: ', len(frames))
     video_clip.close()
-    fa_device = "cuda" if torch.device(device).type == "cuda" else "cpu"
-    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False, device=fa_device)
+    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
     
     for i, frame in enumerate(frames):
         print('\rTracking frame: {}'.format(i + 1), end='')
@@ -218,9 +183,8 @@ def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_
                 face = frame.crop((box[0], box[1], box[2], box[3])).resize((224,224))
                 preds = fa.get_landmarks(np.array(face))
                 
-                if preds is None or len(preds) == 0:
+                if preds is None:
                     raise ValueError(f"Face landmarks not detected in initial frame for speaker {j}")
-                preds = [preds[0]]
                 
                 faces_dic[j].append(face)
                 landmarks_dic[j].append(preds)
@@ -259,11 +223,9 @@ def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_
                 face = frame.crop((box[0], box[1], box[2], box[3])).resize((224,224))
                 preds = fa.get_landmarks(np.array(face))
                 
-                if preds is None or len(preds) == 0:
+                if preds is None:
                     # Use previous landmarks if detection fails
                     preds = landmarks_dic[speaker_id][-1]
-                else:
-                    preds = [preds[0]]
                 
                 faces_dic[speaker_id].append(face)
                 landmarks_dic[speaker_id].append(preds)
@@ -440,7 +402,7 @@ def crop_mouth(video_direc, landmark_direc, filename_path, save_direc, convert_g
             continue
 
         # -- crop
-        mean_face_landmarks = np.load(MEAN_FACE_LANDMARKS_PATH)
+        mean_face_landmarks = np.load('assets/20words_mean_face.npy')
         sequence = crop_patch(mean_face_landmarks, video_pathname, preprocessed_landmarks, 12, 48, 68, 96, 96)
         assert sequence is not None, "cannot crop from {}.".format(filename)
 
@@ -509,12 +471,12 @@ def merge_video_audio(video_file, audio_file, output_file):
 def process_video(input_file, output_path, number_of_speakers=2, 
                   detect_every_N_frame=8, scalar_face_detection=1.5,
                   config_path="checkpoints/vox2/conf.yml",
-                  cuda_device=None,
-                  device="auto"):
+                  cuda_device=None):
     """Main processing function for video speaker separation"""
-
-    run_device = resolve_device(device, cuda_device)
-    print(f"Using compute device: {run_device}")
+    
+    # Set CUDA device if specified
+    if cuda_device is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
     
     # Create output directory
     os.makedirs(output_path, exist_ok=True)
@@ -528,8 +490,7 @@ def process_video(input_file, output_path, number_of_speakers=2,
                               output_path=output_path, 
                               detect_every_N_frame=detect_every_N_frame, 
                               scalar_face_detection=scalar_face_detection, 
-                              number_of_speakers=number_of_speakers,
-                              device=run_device)
+                              number_of_speakers=number_of_speakers)
     
     # Extract audio
     audio_output = os.path.join(output_path, 'audio.wav')
@@ -545,8 +506,8 @@ def process_video(input_file, output_path, number_of_speakers=2,
     
     # Load model
     audiomodel = Dolphin.from_pretrained("JusperLee/Dolphin")
-
-    audiomodel.to(run_device)
+    
+    audiomodel.cuda()
     audiomodel.eval()
     
     # Process each speaker
@@ -556,7 +517,7 @@ def process_video(input_file, output_path, number_of_speakers=2,
             mouth_roi = get_preprocessing_pipelines()["val"](mouth_roi)
             
             mix, sr = torchaudio.load(audio_output)
-            mix = mix.mean(dim=0).to(run_device)
+            mix = mix.cuda().mean(dim=0)
             
             window_size = 4 * sr 
             hop_size = 4 * sr 
@@ -573,10 +534,9 @@ def process_video(input_file, output_path, number_of_speakers=2,
                 end_frame = int(end_idx / sr * 25)
                 end_frame = min(end_frame, len(mouth_roi))
                 window_mouth_roi = mouth_roi[start_frame:end_frame]
-                mouth_tensor = torch.from_numpy(window_mouth_roi[None, None]).float().to(run_device)
                 
                 est_sources = audiomodel(window_mix[None], 
-                                    mouth_tensor)
+                                    torch.from_numpy(window_mouth_roi[None, None]).float().cuda())
                 
                 all_estimates.append({
                     'start': start_idx,
@@ -635,8 +595,6 @@ if __name__ == '__main__':
                         help='Face detection bounding box scale factor (default: 1.5)')
     parser.add_argument('--cuda-device', type=int, default=0,
                         help='CUDA device ID to use (default: 0, set to -1 for CPU)')
-    parser.add_argument('--device', type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"],
-                        help='Compute device (default: auto)')
     parser.add_argument('--config', type=str, default="checkpoints/vox2/conf.yml",
                         help='Path to model configuration file')
     
@@ -654,13 +612,11 @@ if __name__ == '__main__':
     
     # 设置CUDA设备
     cuda_device = args.cuda_device if args.cuda_device >= 0 else None
-    requested_device = "cpu" if args.cuda_device < 0 and args.device == "auto" else args.device
     
     print(f"Processing video: {args.input}")
     print(f"Output directory: {args.output}")
     print(f"Number of speakers: {args.speakers}")
-    print(f"Requested device: {requested_device}")
-    print(f"CUDA device ID: {cuda_device if cuda_device is not None else 'N/A'}")
+    print(f"CUDA device: {cuda_device if cuda_device is not None else 'CPU'}")
     
     # 处理视频
     output_files = process_video(
@@ -670,8 +626,7 @@ if __name__ == '__main__':
         detect_every_N_frame=args.detect_every_n,
         scalar_face_detection=args.face_scale,
         config_path=args.config,
-        cuda_device=cuda_device,
-        device=requested_device
+        cuda_device=cuda_device
     )
     
     print("\nProcessing completed!")

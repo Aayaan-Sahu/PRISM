@@ -35,4 +35,5 @@ dependencies = [
     "websockets",
     "silero-vad>=6.2.1",
     "uvicorn",
+    "websocket-client>=1.9.0",
 ]

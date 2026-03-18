@@ -2,6 +2,20 @@ import os
 import sys
 import modal
 
+
+# TODO: Test if the caching is working
+# this is supposed to cache the models
+def download_models():
+    print("Downloading Dolphin and Face Alignment weights into image...")
+    import face_alignment
+    from huggingface_hub import snapshot_download
+
+    face_alignment.FaceAlignment(
+        face_alignment.LandmarksType.TWO_D, flip_input=False, device="cpu"
+    )
+    snapshot_download("JusperLee/Dolphin")
+
+
 # Docker like contianer with all dolphin dependencies
 # This is cached by modal - only rebuilds when deps change
 dolphin_image = (
@@ -25,7 +39,9 @@ dolphin_image = (
         "tf-keras",
         "opencv-python-headless",
         "numpy<2",
+        "soundfile",
     )
+    .run_function(download_models)
     .add_local_dir(
         os.path.join(os.path.dirname(__file__), "Dolphin"),
         remote_path="/app/Dolphin",
@@ -34,28 +50,35 @@ dolphin_image = (
 
 app = modal.App("dolphin-inference", image=dolphin_image)
 
+
 @app.cls(
     gpu="A100",
-    timeout=180,            # 3 min max per call
-    scaledown_window=60,    # release GPU after 60s of inactivity
+    timeout=240,  # 4 min max per call
+    scaledown_window=60,  # release GPU after 60s of inactivity
 )
 class DolphinSeparator:
     @modal.enter()
     def load_model(self):
         # This function runs once when the container starts
         import torch
-
         os.environ["TF_USE_LEGACY_KERAS"] = "1"
         import tensorflow as tf
-        tf.config.set_visible_devices([], 'GPU')
-
+        tf.config.set_visible_devices([], "GPU")
         sys.path.insert(0, "/app/Dolphin")
 
     @modal.method()
-    def separate(self, video_bytes: bytes, num_speakers: int = 1, tracking_json_bytes: bytes = None) -> dict:
+    def separate(
+        self,
+        video_bytes: bytes,
+        num_speakers: int = 1,
+    ) -> dict:
         import uuid
         import shutil
+        import os
         import json
+
+        os.chdir("/app/Dolphin")
+
         from Inference_with_status import process_video_with_status
 
         # Create a temporary working directory
@@ -65,26 +88,20 @@ class DolphinSeparator:
         input_video_path = os.path.join(work_dir, "input.mp4")
         with open(input_video_path, "wb") as f:
             f.write(video_bytes)
-            
-        target_boxes = None
-        if tracking_json_bytes is not None:
-            target_boxes = json.loads(tracking_json_bytes)
-            print(f"[Modal] Received targeted tracking JSON with {len(target_boxes)} frames.")
-        
+
+        # define a modal directory for the dolphin output
         output_dir = os.path.join(work_dir, "output")
         os.makedirs(output_dir, exist_ok=True)
 
-        # define a logger for dolphin inference
-        def status_logger(message):
-            status = message.get("status", "")
-            progress = message.get("progress")
-            if progress is None:
-                print(f"[Modal Status] {status}")
-            else:
-                print(f"[Modal Status {float(progress) * 100:5.1f}%] {status}")
+        def status_callback(update):
+            status = update.get("status", "Working...")
+            progress = update.get("progress", 0.0)
 
-        print(f"[Modal] Running Dolphin inference on {num_speakers} speaker(s)...")
+            # Use standard print for reliable Modal log streaming
+            print(f"[Modal] {progress * 100:6.2f}% | {status}")
+
         # Run inference using CUDA
+        print(f"[Modal] Running Dolphin inference on {num_speakers} speaker(s)...")
         output_files = process_video_with_status(
             input_file=input_video_path,
             output_path=output_dir,
@@ -92,11 +109,9 @@ class DolphinSeparator:
             detect_every_N_frame=8,
             scalar_face_detection=1.5,
             cuda_device=0,
-            device="cuda",
-            status_callback=status_logger,
-            target_boxes=target_boxes,
+            status_callback=status_callback,
         )
-        
+
         print("[Modal] Collecting output files...")
         results = {}
         for file_path in output_files:
@@ -106,7 +121,10 @@ class DolphinSeparator:
                     results[filename] = f.read()
 
         # Grab the isolated audio as well
-        audio_paths = [os.path.join(output_dir, f"speaker{i+1}_est.wav") for i in range(num_speakers)]
+        audio_paths = [
+            os.path.join(output_dir, f"speaker{i + 1}_est.wav")
+            for i in range(num_speakers)
+        ]
         for audio_path in audio_paths:
             if os.path.exists(audio_path):
                 filename = os.path.basename(audio_path)
@@ -118,7 +136,12 @@ class DolphinSeparator:
         shutil.rmtree(work_dir, ignore_errors=True)
         return results
 
-def main(video_path: str = "output_faces.mp4", num_speakers: int = 1, output_dir: str = "modal_output", tracking_path: str = "target_tracking.json"):
+
+def main(
+    video_path: str = "output_faces.mp4",
+    num_speakers: int = 1,
+    output_dir: str = "modal_output",
+):
     if not os.path.exists(video_path):
         print(f"Error: Could not find input video '{video_path}'")
         return
@@ -129,26 +152,31 @@ def main(video_path: str = "output_faces.mp4", num_speakers: int = 1, output_dir
     print(f"Reading {video_path}...")
     with open(video_path, "rb") as f:
         video_bytes = f.read()
-        
-    tracking_json_bytes = None
-    if os.path.exists(tracking_path):
-        print(f"Reading target tracking data {tracking_path}...")
-        with open(tracking_path, "rb") as f:
-            tracking_json_bytes = f.read()
 
     print(f"Sending video to Modal for inference (Job: {base_name})...")
     with app.run():
         separator = DolphinSeparator()
-        results = separator.separate.remote(video_bytes, num_speakers, tracking_json_bytes)
+        results = separator.separate.remote(video_bytes, num_speakers)
 
     if results:
         os.makedirs(job_output_dir, exist_ok=True)
         print(f"Writing outputs to {job_output_dir}/ ...")
+        speaker_wav_path = None
         for filename, data in results.items():
             out_path = os.path.join(job_output_dir, filename)
             with open(out_path, "wb") as f:
                 f.write(data)
             print(f"  Saved {out_path}")
+            # Track the first speaker audio file — this is the clean wav for enrollment
+            if filename.endswith("_est.wav") and speaker_wav_path is None:
+                speaker_wav_path = out_path
         print("Done!")
+
+        # returning speaker_wav_path is essential because we need to create an embedding from that file
+        return speaker_wav_path
     else:
         print("No results returned from Modal.")
+        return None
+
+
+# main("output_fast_1773775070.mp4")
