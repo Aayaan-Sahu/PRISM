@@ -18,7 +18,7 @@ from understanding_enroll import enroll_from_wav, upload_embedding
 # TODO: Set this after `modal deploy understanding_tse.py`
 TSE_WS_URL = "wss://spacial-audio-recognition--spatial-audio-tse-tseruntime-serve.modal.run/ws"
 TSE_SAMPLE_RATE = 16_000
-TSE_CHUNK_DURATION = 0.50  # 500 ms
+TSE_CHUNK_DURATION = 0.30  # 500 ms
 TSE_CHUNK_SAMPLES = int(TSE_SAMPLE_RATE * TSE_CHUNK_DURATION)  # 2400 samples
 
 # This is a queue that holds the file paths of all the video files that are yet
@@ -173,7 +173,76 @@ def tse_streaming_thread(shutdown_event: threading.Event):
         tse_ws = None
         return
 
-    # --- Open audio streams and run the send/recv loop ---
+    # --- Inner thread: send mic audio to server ---
+    def _tse_send_loop():
+        sends_count = 0
+        try:
+            while not shutdown_event.is_set():
+                try:
+                    raw_chunk = send_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                # Resample to 16 kHz if mic runs at a different rate
+                if resampler is not None:
+                    import torch
+                    tensor = torch.from_numpy(raw_chunk).float().unsqueeze(0)
+                    resampled = resampler(tensor).squeeze().numpy()
+                else:
+                    resampled = raw_chunk
+
+                # Convert float32 [-1, 1] -> PCM16 and send
+                pcm16 = (np.clip(resampled, -1.0, 1.0) * 32767).astype(np.int16)
+                ws.send_binary(pcm16.tobytes())
+                sends_count += 1
+
+                # Debug: log every 20th send
+                if sends_count % 20 == 0:
+                    in_energy = float(np.mean(resampled ** 2))
+                    print(f"[TSE SEND] #{sends_count} energy={in_energy:.6f}")
+
+        except websocket.WebSocketConnectionClosedException:
+            print("[TSE SEND] WebSocket closed")
+        except Exception as e:
+            print(f"[TSE SEND] Error: {e}")
+
+    # --- Inner thread: receive filtered audio from server ---
+    def _tse_recv_loop():
+        recv_count = 0
+        try:
+            while not shutdown_event.is_set():
+                try:
+                    opcode, response = ws.recv_data()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except websocket.WebSocketConnectionClosedException:
+                    break
+
+                if opcode == websocket.ABNF.OPCODE_BINARY:
+                    # Filtered PCM16 audio — decode and queue for playback
+                    filtered = np.frombuffer(response, dtype=np.int16).astype(np.float32) / 32768.0
+                    playback_queue.put(filtered)
+                    recv_count += 1
+
+                    # Debug: log received audio energy every 20th chunk
+                    if recv_count % 20 == 0:
+                        out_energy = float(np.mean(filtered ** 2))
+                        is_silence = out_energy < 1e-8
+                        print(f"[TSE RECV] #{recv_count} energy={out_energy:.6f} {'(silence)' if is_silence else '(has audio)'}")
+
+                elif opcode == websocket.ABNF.OPCODE_TEXT:
+                    msg = json.loads(response.decode("utf-8"))
+                    msg_type = msg.get("type", "")
+
+                    if msg_type == "embeddings_loaded":
+                        print(f"[TSE] Reloaded: {msg['count']} speaker(s)")
+                    elif msg_type == "error":
+                        print(f"[TSE] Server error: {msg['detail']}")
+
+        except Exception as e:
+            print(f"[TSE RECV] Error: {e}")
+
+    # --- Open audio streams and run send/recv on separate threads ---
     try:
         with sd.InputStream(
             samplerate=native_sr,
@@ -188,68 +257,16 @@ def tse_streaming_thread(shutdown_event: threading.Event):
                 callback=speaker_callback,
             ):
                 print("[TSE CLIENT] Streaming started (mic -> TSE -> speakers)")
-                sends_count = 0
 
-                while not shutdown_event.is_set():
-                    # --- Send: grab mic chunk, resample if needed, send as PCM16 ---
-                    try:
-                        raw_chunk = send_queue.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
+                send_t = threading.Thread(target=_tse_send_loop, daemon=True)
+                recv_t = threading.Thread(target=_tse_recv_loop, daemon=True)
+                send_t.start()
+                recv_t.start()
 
-                    # Resample to 16 kHz if mic runs at a different rate
-                    if resampler is not None:
-                        import torch
-                        tensor = torch.from_numpy(raw_chunk).float().unsqueeze(0)
-                        resampled = resampler(tensor).squeeze().numpy()
-                    else:
-                        resampled = raw_chunk
+                # Block until shutdown — keeps audio streams alive
+                send_t.join()
+                recv_t.join()
 
-                    # Convert float32 [-1, 1] -> PCM16 and send
-                    pcm16 = (np.clip(resampled, -1.0, 1.0) * 32767).astype(np.int16)
-                    ws.send_binary(pcm16.tobytes())
-                    sends_count += 1
-
-                    # Debug: log every 20th send
-                    if sends_count % 20 == 0:
-                        in_energy = float(np.mean(resampled ** 2))
-                        print(f"[TSE CLIENT] sent #{sends_count} samples={len(pcm16)} in_energy={in_energy:.6f}")
-
-                    # --- Recv: server sends back filtered audio (binary) or messages (text) ---
-                    try:
-                        opcode, response = ws.recv_data()
-                    except websocket.WebSocketTimeoutException:
-                        continue
-
-                    if opcode == websocket.ABNF.OPCODE_BINARY:
-                        # Filtered PCM16 audio — decode and queue for playback
-                        filtered = np.frombuffer(response, dtype=np.int16).astype(np.float32) / 32768.0
-                        playback_queue.put(filtered)
-
-                        # Debug: log received audio energy every 20th chunk
-                        if sends_count % 20 == 0:
-                            out_energy = float(np.mean(filtered ** 2))
-                            is_silence = out_energy < 1e-8
-                            print(f"[TSE CLIENT] recv #{sends_count} out_energy={out_energy:.6f} {'(silence)' if is_silence else '(has audio)'}")
-
-                    elif opcode == websocket.ABNF.OPCODE_TEXT:
-                        msg = json.loads(response.decode("utf-8"))
-                        msg_type = msg.get("type", "")
-
-                        if msg_type == "stats":
-                            sim = msg.get("best_similarity", 0)
-                            ms = msg.get("process_ms", 0)
-                            chunks = msg.get("chunks", 0)
-                            print(f"[TSE] sim={sim:.3f} latency={ms:.0f}ms chunks={chunks}")
-
-                        elif msg_type == "embeddings_loaded":
-                            print(f"[TSE] Reloaded: {msg['count']} speaker(s)")
-
-                        elif msg_type == "error":
-                            print(f"[TSE] Server error: {msg['detail']}")
-
-    except websocket.WebSocketConnectionClosedException:
-        print("[TSE CLIENT] WebSocket connection closed by server")
     except Exception as e:
         print(f"[TSE CLIENT] Streaming error: {e}")
         import traceback

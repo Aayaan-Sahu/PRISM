@@ -98,7 +98,7 @@ embeddings_volume = modal.Volume.from_name("tse-embeddings", create_if_missing=T
 # Constants
 # ---------------------------------------------------------------------------
 MODEL_SAMPLE_RATE = 16_000
-CHUNK_SAMPLES = int(MODEL_SAMPLE_RATE * 0.50)       # 500 ms per chunk from client
+CHUNK_SAMPLES = int(MODEL_SAMPLE_RATE * 0.30)       # 500 ms per chunk from client
 WINDOW_SAMPLES = int(MODEL_SAMPLE_RATE * 2.0)       # 2 s sliding window for WeSep context
 SIMILARITY_THRESHOLD = 0.35                          # cosine sim gate for ECAPA verification
 WARMUP_CHUNKS = 4                                    # fill the window before processing
@@ -401,15 +401,14 @@ class TSERuntime:
                     out_i16 = (mix_out * 32767.0).to(torch.int16).cpu().numpy()
                     await websocket.send_bytes(out_i16.tobytes())
 
-                    # Periodic stats
+                    # Periodic stats (server-side only — visible via `modal app logs`)
                     if chunks_received % 10 == 0:
                         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                        await websocket.send_text(json.dumps({
-                            "type": "stats",
-                            "best_similarity": round(best_sim, 3),
-                            "process_ms": round(elapsed_ms, 1),
-                            "chunks": chunks_received,
-                        }))
+                        print(
+                            f"[TSE] chunk#{chunks_received} sim={best_sim:.3f} "
+                            f"process_ms={elapsed_ms:.1f}",
+                            flush=True,
+                        )
 
             except WebSocketDisconnect:
                 print("[TSE] Client disconnected", flush=True)
