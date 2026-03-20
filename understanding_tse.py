@@ -98,7 +98,7 @@ embeddings_volume = modal.Volume.from_name("tse-embeddings", create_if_missing=T
 # Constants
 # ---------------------------------------------------------------------------
 MODEL_SAMPLE_RATE = 16_000
-CHUNK_SAMPLES = int(MODEL_SAMPLE_RATE * 0.30)       # 500 ms per chunk from client
+CHUNK_SAMPLES = int(MODEL_SAMPLE_RATE * 0.40)       # 500 ms per chunk from client
 WINDOW_SAMPLES = int(MODEL_SAMPLE_RATE * 2.0)       # 2 s sliding window for WeSep context
 SIMILARITY_THRESHOLD = 0.35                          # cosine sim gate for ECAPA verification
 WARMUP_CHUNKS = 4                                    # fill the window before processing
