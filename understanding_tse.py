@@ -283,8 +283,14 @@ class TSERuntime:
                 return
 
             # -- Per-connection state --
-            # Sliding window: deque auto-evicts old samples when full (same as enroll_demo.py)
-            audio_buf = collections.deque(maxlen=WINDOW_SAMPLES)
+            # Sliding window: pre-filled with zeros so the warmup gate never fires
+            audio_buf = collections.deque(
+                np.zeros(WINDOW_SAMPLES, dtype=np.float32), 
+                maxlen=WINDOW_SAMPLES
+            )
+            # Replay buffer for verified audio, used when the window is mostly silent
+            confirmed_speaker_buf = collections.deque(maxlen=WINDOW_SAMPLES)
+            
             enrolled = self.load_embeddings()
             chunks_received = 0
 
@@ -359,6 +365,9 @@ class TSERuntime:
                         await websocket.send_bytes(np.zeros(chunk_len, dtype=np.int16).tobytes())
                         continue
 
+                    # Track the energy of the current 2-second window
+                    window_energy = float(np.mean(np.array(audio_buf) ** 2))
+
                     # Build the 2s context tensor from the deque
                     window = torch.from_numpy(np.array(audio_buf)).unsqueeze(0).float()  # (1, WINDOW_SAMPLES)
 
@@ -368,11 +377,36 @@ class TSERuntime:
 
                     for speaker in enrolled:
                         try:
-                            # Step 1: WeSep extracts the target speaker's voice
-                            separated = self.extract_for_target(window, speaker["ref_wav"])
+                            # Sparse Window Path (skip WeSep, use raw audio)
+                            if window_energy < 1e-4:
+                                # Prepend recent confirmed audio to give ECAPA more context
+                                if len(confirmed_speaker_buf) > 0:
+                                    context_np = np.concatenate([np.array(confirmed_speaker_buf), chunk_np])
+                                else:
+                                    context_np = chunk_np
+                                
+                                # cap length to avoid errors
+                                if len(context_np) > WINDOW_SAMPLES:
+                                    context_np = context_np[-WINDOW_SAMPLES:]
+                                    
+                                raw_tensor = torch.from_numpy(context_np).unsqueeze(0).float()
+                                sep_emb = self.compute_embedding(raw_tensor)
+                                
+                                # Output is the raw chunk (CPU tensor)
+                                tail_audio = torch.from_numpy(chunk_np).float()
+                                threshold = 0.25
+                                
+                            # Dense Window Path (normal WeSep separation)
+                            else:
+                                # WeSep extracts target from the full 2s window
+                                separated = self.extract_for_target(window, speaker["ref_wav"])
 
-                            # Step 2: ECAPA embeds the separated output for verification
-                            sep_emb = self.compute_embedding(separated)
+                                # ECAPA embeds the full separated output (2s) for highest reliability
+                                sep_emb = self.compute_embedding(separated)
+                                
+                                # Grab tail chunk for audio output
+                                tail_audio = separated[0, -chunk_len:]
+                                threshold = SIMILARITY_THRESHOLD
 
                             # Step 3: Cosine similarity gate
                             sim = F.cosine_similarity(
@@ -384,13 +418,15 @@ class TSERuntime:
 
                             # Debug: log match/no-match for every 10th chunk
                             if chunks_received % 10 == 0:
-                                status = "✅ MATCH" if sim >= SIMILARITY_THRESHOLD else "❌ no match"
-                                sep_energy = float(separated[0, -chunk_len:].pow(2).mean())
-                                print(f"[TSE] speaker={speaker['id']} sim={sim:.3f} {status} sep_energy={sep_energy:.6f}", flush=True)
+                                status = "✅ MATCH" if sim >= threshold else "❌ no match"
+                                mode = "SPARSE" if window_energy < 1e-4 else "DENSE"
+                                sep_energy = float(tail_audio.pow(2).mean())
+                                print(f"[TSE] speaker={speaker['id']} sim={sim:.3f} thr={threshold:.2f} {status} [{mode}] energy={sep_energy:.6f}", flush=True)
 
-                            if sim >= SIMILARITY_THRESHOLD:
-                                # Only take the tail chunk_len samples (the new data)
-                                mix_out += separated[0, -chunk_len:]
+                            if sim >= threshold:
+                                mix_out += tail_audio
+                                # Bank the verified raw chunk for future sparse context
+                                confirmed_speaker_buf.extend(chunk_np)
 
                         except Exception as e:
                             print(f"[TSE] speaker={speaker['id']} error={e}", flush=True)

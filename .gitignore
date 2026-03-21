@@ -9,3 +9,7 @@ old/
 Dolphin/**/__pycache__/
 
 __pycache__/**
+
+embeddings/
+modal_output/
+recordings/
