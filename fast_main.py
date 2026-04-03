@@ -18,7 +18,7 @@ from understanding_enroll import enroll_from_wav, upload_embedding
 # TODO: Set this after `modal deploy understanding_tse.py`
 TSE_WS_URL = "wss://spacial-audio-recognition--spatial-audio-tse-tseruntime-serve.modal.run/ws"
 TSE_SAMPLE_RATE = 16_000
-TSE_CHUNK_DURATION = 0.40  # 500 ms
+TSE_CHUNK_DURATION = 0.15  # 150 ms
 TSE_CHUNK_SAMPLES = int(TSE_SAMPLE_RATE * TSE_CHUNK_DURATION)  # 2400 samples
 
 # This is a queue that holds the file paths of all the video files that are yet
