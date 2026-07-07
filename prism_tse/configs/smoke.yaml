@@ -1,0 +1,20 @@
+# Tiny smoke-test run: proves the full pipeline (mixer -> model -> loss -> ckpt -> resume)
+# on synthetic data in under a minute, CPU or GPU. Used by tests/test_smoke_train.py.
+
+train:
+  batch: 4
+  steps: 20
+  lr: 1.0e-3
+  warmup: 5
+  workers: 0
+  val_every: 10
+  ckpt_every: 10
+  keep_last: 2
+  n_val: 4
+  log_every: 5
+  fake_ecapa: true
+  amp: false
+
+paths:
+  data_root: data_root
+  run_dir: runs/smoke

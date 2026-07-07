@@ -1,0 +1,14 @@
+# PRISM-TSE training requirements (standalone — matches the repo's core pins)
+torch==2.8.0
+torchaudio==2.8.0
+speechbrain>=1.0.3
+huggingface-hub<1.0
+numpy
+scipy
+soundfile
+pyyaml
+tensorboard
+pyroomacoustics   # only needed by data/generate_rirs.py
+pyloudnorm        # optional at runtime (RMS fallback exists), recommended
+tqdm
+pytest

@@ -1,0 +1,62 @@
+# PRISM-TSE full training recipe (H200, ~400k steps).
+# Any key omitted here falls back to the dataclass defaults in config.py.
+
+audio:
+  sr: 16000
+  n_fft: 512
+  hop: 256
+  power: 0.3
+
+model:
+  hidden: 256
+  spk_dim: 128
+  emb_dim: 192
+  n_lstm: 3
+  freq_conv_blocks: 2
+  freq_conv_ch: 8
+  freq_conv_kernel: 5
+
+mixer:
+  segment_s: 4.0
+  scenario_probs:
+    target_alone: 0.10
+    target_noise: 0.20
+    target_1interf: 0.25
+    target_1interf_noise: 0.20
+    target_2interf_noise: 0.10
+    target_absent: 0.15
+  sir_db: [-5.0, 20.0]
+  snr_db: [0.0, 25.0]
+  lufs: [-38.0, -22.0]
+  clip_prob: 0.10
+  reverb_prob: 0.9
+  early_ms: 50.0
+  enroll_degrade_prob: 0.5
+  enroll_snr_db: [15.0, 30.0]
+  min_utt_s: 3.0
+  enroll_crop_s: 4.0
+  active_thresh_db: -40.0
+
+train:
+  batch: 32
+  steps: 400000
+  lr: 1.0e-3
+  weight_decay: 1.0e-2
+  warmup: 10000
+  clip: 5.0
+  workers: 8
+  val_every: 5000
+  ckpt_every: 5000
+  keep_last: 3
+  seed: 1234
+  sisdr_w: 1.0
+  spec_w: 30.0
+  spec_alpha: 8.0
+  absent_w: 10.0
+  n_val: 500
+  log_every: 50
+  amp: true
+
+paths:
+  data_root: data_root
+  run_dir: runs/prism_tse_v1
